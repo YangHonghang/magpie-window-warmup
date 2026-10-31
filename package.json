@@ -1,0 +1,68 @@
+{
+  "name": "magpie-window-warmup",
+  "version": "0.1.0",
+  "description": "窗口预热 Window Warmup：定时消息插件，定时给指定供应商/账号/模型发一条短消息，在额度窗口重置后、每天定时或每隔几小时自动预热保活，提前开启5小时/每周订阅额度（配额）窗口，适用 Codex、Claude、GLM 智谱、ZCode 等。Scheduled keep-alive message to warm up quota / usage / rate limit windows after reset (cron-like).",
+  "type": "module",
+  "license": "MIT",
+  "main": "dist/plugin.js",
+  "files": [
+    "dist",
+    "page",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "magpie": ">=0.1.1340",
+    "bun": ">=1.4.2"
+  },
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "magpie": {
+    "page": {
+      "title": "Window Warmup",
+      "titles": {
+        "zh": "窗口预热",
+        "zh-TW": "窗口預熱",
+        "ja": "ウィンドウ予熱"
+      },
+      "file": "page/index.html",
+      "service": {
+        "port": 3492,
+        "option": "port"
+      }
+    },
+    "options": {
+      "port": 3492
+    },
+    "permissions": []
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/bun": "1.4.4"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YangHonghang/magpie-window-warmup.git"
+  },
+  "homepage": "https://github.com/YangHonghang/magpie-window-warmup#readme",
+  "bugs": "https://github.com/YangHonghang/magpie-window-warmup/issues",
+  "keywords": [
+    "magpie",
+    "magpie-page",
+    "magpie-plugin",
+    "llm",
+    "window-warmup",
+    "cron",
+    "quota",
+    "warmup",
+    "keep-alive",
+    "schedule",
+    "rate-limit"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
