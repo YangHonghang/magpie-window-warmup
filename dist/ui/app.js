@@ -8,6 +8,8 @@ var CATALOG_POLL_MS = 60000;
 var RUNS_PREVIEW = 5;
 var RUNS_MAX = 50;
 var DELETE_CONFIRM_MS = 3000;
+var MODEL_SOURCE_HINT = "模型列表来自 Magpie 上次获取的结果。账号和模型对不上时，到 Magpie「供应商」里打开这个供应商，点「获取模型」，再回来刷新本页。";
+var NO_MODELS_HINT = "还没有这个供应商的模型列表。请到 Magpie「供应商」里打开它，点「获取模型」。";
 function statusOf(task, runs) {
   if (!task.enabled)
     return { tone: "", text: "已停用" };
@@ -55,8 +57,10 @@ function runTimeLabel(iso, now) {
     return `昨天 ${hm}`;
   return `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 }
-function rowSub(task) {
-  return `${trigText(task.trigger)} · ${task.account || "自动选账号"} · ${task.model ? shortModel(task.model) : "自动选模型"}`;
+function rowSub(task, providers) {
+  const acct = providers.find((p) => p.id === task.provider)?.accounts.find((a) => a.id === task.account);
+  const who = task.account ? acct?.label || task.account : "自动选账号";
+  return `${trigText(task.trigger)} · ${who} · ${task.model ? shortModel(task.model) : "自动选模型"}`;
 }
 function trigText(trigger) {
   switch (trigger.kind) {
@@ -114,27 +118,45 @@ function runReason(r) {
 function accountOptions(providerId, current, allowAuto, providers) {
   const list = [];
   if (allowAuto)
-    list.push({ value: "", text: "自动选择" });
+    list.push({ value: "", text: "自动（由 Magpie 选）" });
   const provider = providers.find((p) => p.id === providerId);
   if (current && !provider?.accounts.some((a) => a.id === current)) {
-    list.push({ value: current, text: current });
+    list.push({ value: current, text: `${current}（不在当前账号列表）` });
   }
   for (const a of provider?.accounts ?? []) {
-    list.push({ value: a.id, text: a.label && a.label !== a.id ? `${a.label}（${a.id}）` : a.id });
+    if (a.kind === "key" && a.label && a.label !== a.id)
+      list.push({ value: a.id, text: a.label, aux: a.id });
+    else
+      list.push({ value: a.id, text: a.label || a.id });
   }
   if (!list.length)
     list.push({ value: "", text: "该供应商没有账号" });
   return list;
 }
-function modelOptions(providerId, current, providers) {
-  const list = [{ value: "", text: "自动", aux: "小模型优先" }];
+function accountModelView(provider, accountId) {
+  const acct = accountId ? provider?.accounts.find((a) => a.id === accountId) : undefined;
+  if (!acct) {
+    return {
+      models: provider?.autoAccountModels ?? null,
+      autoModel: provider?.autoModel ?? null,
+      perAccount: null
+    };
+  }
+  return { models: acct.models, autoModel: acct.autoModel, perAccount: acct.perAccount };
+}
+function modelOptions(providerId, accountId, current, providers) {
   const provider = providers.find((p) => p.id === providerId);
-  if (current && !provider?.models.some((m) => m.id === current)) {
+  const view = accountModelView(provider, accountId);
+  const list = [];
+  const auto = { value: "", text: "自动" };
+  if (view.autoModel)
+    auto.aux = modelDisplay(view.autoModel, providerId);
+  list.push(auto);
+  const known = view.models ?? [];
+  if (current && !known.includes(current))
     list.push({ value: current, text: current });
-  }
-  for (const m of provider?.models ?? []) {
-    list.push({ value: m.id, text: modelDisplay(m.id, providerId) });
-  }
+  for (const id of view.models ?? [])
+    list.push({ value: id, text: modelDisplay(id, providerId) });
   return list;
 }
 function windowAux(w) {
@@ -160,16 +182,17 @@ function windowOptions(providerId, accountId, current, providers) {
 function forceWindowAccount(providerId, providers) {
   return providers.find((p) => p.id === providerId)?.accounts[0]?.id ?? "";
 }
-function modelHint(model, provider) {
+function modelHint(model, provider, accountId) {
   const autoSub = "名字带 flash / lite / mini 的小模型优先，每次发送前重新选；思考能关就关，不能关用最低档。";
   const fixedSub = "思考档位按这个模型的配置自动决定：能关就关，不能关用最低档。";
   if (model) {
     const m = provider?.models.find((x) => x.id === model);
     return { main: m ? effortLabel(m.effort) : "思考：目录里暂时没有这个模型", sub: fixedSub };
   }
-  const autoId = provider?.autoModel ?? null;
-  if (!autoId)
-    return { main: "该供应商没有可用模型", sub: autoSub };
+  const autoId = accountModelView(provider, accountId).autoModel;
+  if (!autoId) {
+    return { main: accountId ? "这个账号没有可用模型" : "该供应商没有可用模型", sub: autoSub };
+  }
   const m = provider?.models.find((x) => x.id === autoId);
   const think = m ? effortLabel(m.effort) : "思考：目录里暂时没有这个模型";
   return { main: `自动选中 ${shortModel(autoId)} · ${think}`, sub: autoSub };
@@ -335,7 +358,6 @@ function contentOf(d) {
     provider: d.provider,
     account: d.account,
     model: d.model,
-    message: d.message,
     trigger: d.trigger
   };
 }
@@ -416,11 +438,15 @@ function closePop() {
   popEl.remove();
   popEl = null;
 }
-function sel(label, opts, val, onchange) {
+function sel(label, opts, val, onchange, disabled = false) {
   const b = el("button", "field");
   b.type = "button";
-  b.setAttribute("aria-haspopup", "listbox");
-  b.setAttribute("aria-expanded", "false");
+  if (disabled)
+    b.disabled = true;
+  else {
+    b.setAttribute("aria-haspopup", "listbox");
+    b.setAttribute("aria-expanded", "false");
+  }
   const cur = opts.find((o) => o.value === val) ?? opts[0];
   const kv = el("span", "kv");
   if (label)
@@ -534,15 +560,14 @@ var f = null;
 function markDirty() {
   dirty = true;
 }
-function onTextEdit(kind, apply) {
-  const node = kind === "name" ? f?.name : f?.msg;
-  const caret = node?.selectionStart ?? null;
+function onNameInput(apply) {
+  const caret = f?.name.selectionStart ?? null;
   apply();
   formError = null;
   if (!dirty) {
     dirty = true;
     render();
-    const again = kind === "name" ? f?.name : f?.msg;
+    const again = f?.name;
     if (again) {
       again.focus();
       const pos = Math.min(caret ?? again.value.length, again.value.length);
@@ -744,7 +769,7 @@ function buildEditor() {
   name.value = d.name;
   name.maxLength = NAME_MAX;
   name.placeholder = "给任务起个名字";
-  name.addEventListener("input", () => onTextEdit("name", () => {
+  name.addEventListener("input", () => onNameInput(() => {
     if (draft)
       draft.name = name.value;
   }));
@@ -770,27 +795,42 @@ function buildEditor() {
   }));
   if (d.trigger.kind === "window" && !d.account)
     d.account = forceWindowAccount(d.provider, providers);
-  const allowAuto = d.trigger.kind !== "window";
-  fs.append(sel("账号", accountOptions(d.provider, d.account, allowAuto, providers), d.account, (v) => {
-    markDirty();
+  const adoptAccount = (v) => {
     if (!draft)
       return;
     draft.account = v;
-    if (draft.trigger.kind === "window") {
+    if (draft.model && !accountModelView(provider, v).models?.includes(draft.model))
+      draft.model = "";
+  };
+  const allowAuto = d.trigger.kind !== "window";
+  fs.append(sel("账号", accountOptions(d.provider, d.account, allowAuto, providers), d.account, (v) => {
+    markDirty();
+    adoptAccount(v);
+    if (draft && draft.trigger.kind === "window") {
       draft.trigger = { kind: "window", window: windowOptions(draft.provider, v, "", providers).find((o) => o.value)?.value ?? "" };
     }
     formError = null;
     render();
   }));
-  fs.append(sel("模型", modelOptions(d.provider, d.model, providers), d.model, (v) => {
+  const view = accountModelView(provider, d.account);
+  fs.append(sel("模型", modelOptions(d.provider, d.account, d.model, providers), d.model, (v) => {
     markDirty();
     if (draft)
       draft.model = v;
     formError = null;
     render();
-  }));
-  const mh = modelHint(d.model, provider);
-  const parts = [fs, el("div", "hint", mh.main), el("div", "hint mute", mh.sub)];
+  }, view.models === null));
+  const parts = [fs];
+  if (view.models === null) {
+    parts.push(el("div", "hint warn", NO_MODELS_HINT));
+  } else {
+    const mh = modelHint(d.model, provider, d.account);
+    parts.push(el("div", "hint", mh.main), el("div", "hint mute", mh.sub));
+    if (view.perAccount === false) {
+      parts.push(el("div", "hint mute", "这个供应商没有按账号区分的模型列表，列出的是全部模型"));
+    }
+    parts.push(el("div", "hint mute", MODEL_SOURCE_HINT));
+  }
   if (d.trigger.kind === "window") {
     parts.push(el("div", "hint mute", "跟随窗口重置时必须指定账号，每个账号的窗口各自计时。"));
   }
@@ -804,8 +844,7 @@ function buildEditor() {
         return;
       markDirty();
       if (k === "window") {
-        if (!draft.account)
-          draft.account = forceWindowAccount(draft.provider, providers);
+        adoptAccount(draft.account || forceWindowAccount(draft.provider, providers));
         draft.trigger = { kind: "window", window: windowOptions(draft.provider, draft.account, "", providers).find((o) => o.value)?.value ?? "" };
       } else if (k === "daily") {
         draft.trigger = { kind: "daily", time: "06:00", timeZone: localTZ() };
@@ -904,15 +943,6 @@ function buildEditor() {
     nextEl.append("接下来 ", el("b", undefined, dates.length ? dates.map((x) => nextLabel(x.toISOString(), now)).join(" · ") : "—"));
   }
   row(ed, "触发", seg, line, nextEl);
-  const msg = el("textarea", "text");
-  msg.rows = 1;
-  msg.maxLength = 200;
-  msg.value = d.message;
-  msg.addEventListener("input", () => onTextEdit("msg", () => {
-    if (draft)
-      draft.message = msg.value;
-  }));
-  row(ed, "消息", msg, el("div", "hint mute", "回复最多 16 个 token；30 秒没结果记为「结果未知」，不会自动重发。"));
   const act = el("div", "actions full");
   const del = el("button", "btn danger", saved ? deleteArmed(confirmDeleteAt, Date.now()) ? "确认删除" : "删除" : "放弃");
   del.type = "button";
@@ -966,7 +996,7 @@ function buildEditor() {
   }
   box.append(runsBox);
   ed.append(box);
-  f = { name, msg };
+  f = { name };
   return ed;
 }
 function draftDisplaySig() {
@@ -979,7 +1009,16 @@ function catalogSig() {
   return JSON.stringify((catalog?.providers ?? []).map((p) => [
     p.id,
     p.autoModel,
-    p.accounts.map((a) => [a.id, a.label, a.windows.map((w) => [w.name, w.used, w.resetsAt])]),
+    p.autoAccountModels,
+    p.accounts.map((a) => [
+      a.id,
+      a.label,
+      a.kind,
+      a.perAccount,
+      a.autoModel,
+      a.models,
+      a.windows.map((w) => [w.name, w.used, w.resetsAt])
+    ]),
     p.models.map((m) => m.id)
   ]));
 }
@@ -995,7 +1034,7 @@ function rowEl(view, saved, isOpen) {
   r.setAttribute("role", "button");
   r.setAttribute("aria-expanded", isOpen ? "true" : "false");
   const who = el("div", "who");
-  who.append(el("div", "name", view.name || "未命名任务"), el("div", "sub", rowSub(view)));
+  who.append(el("div", "name", view.name || "未命名任务"), el("div", "sub", rowSub(view, catalog?.providers ?? [])));
   const when = el("div", "when");
   if (view.enabled) {
     const at = saved ? state?.next[saved.id] ?? null : null;
@@ -1229,7 +1268,9 @@ if (typeof document !== "undefined") {
 }
 export {
   DELETE_CONFIRM_MS,
+  accountModelView,
   accountOptions,
+  contentOf,
   deleteArmed,
   effortLabel,
   forceWindowAccount,

@@ -2,7 +2,7 @@
 
 Window Warmup is a page plugin for [magpie](https://usemagpie.ai) that sends a short keep-alive message to a provider, account and model of your choice — right after a quota window resets, at a fixed time of day, or every few hours — so the next subscription usage window opens early. It runs inside the Magpie host process; a local page manages tasks and shows run history.
 
-在 magpie 窗口里按计划给指定供应商、账号和模型发一条短消息，用来提前开启下一轮额度（订阅）窗口。消息固定 `max_tokens: 16`，只当探活用；**每条消息都会真实发给所选模型并计费**。
+在 magpie 窗口里按计划给指定供应商、账号和模型发一条短消息，用来提前开启下一轮额度（订阅）窗口。消息内容固定为 `hi`、`max_tokens: 16`，只当探活用，不可自定义；**每条消息都会真实发给所选模型并计费**。
 
 ## 安装
 
@@ -31,13 +31,14 @@ magpie plugin add github:YangHonghang/magpie-window-warmup
 
 ## 模型与思考档位
 
-模型选「自动」时，任务里不存选中值，每次发送前在该供应商的模型里现选：
+模型选「自动」时，任务里不存选中值，每次发送前按统一账号规则现选（目录与调度器同一份实现）：
 
-- 按模型 id 最后一段出现的规格词排序 `flash < lite < mini < nano < small < turbo`（整词匹配、不分大小写，"minimax" 不算 mini），都不含的排最后；
-- 同档按 id 数字感知降序（新版本优先），取第一个；
-- 一个模型都选不到 → 本次失败「供应商 X 下没有可用模型」。
+- 可选模型以 Magpie 的模型缓存为基础，按账号收窄：key 账号只留该 key 能看到的模型（缓存里的 Keys 指纹），providers.json 的 accountModels 给账号配了清单就只留清单内的；
+- 没有模型缓存的供应商（插件型订阅供应商本来就不写缓存）退而用 `/v1/models` 里的全部模型，此时不按账号区分；连 `/v1/models` 都没有该供应商的模型 → 本次失败「供应商 X 还没有模型列表，无法自动选模型」；
+- 收窄后按模型 id 最后一段的规格词排序 `flash < lite < mini < nano < small < turbo`（整词匹配、不分大小写，"minimax" 不算 mini），都不含的排最后；同档按 id 数字感知降序（新版本优先），取第一个；
+- 收窄后一个模型都不剩 → 本次失败「账号 X 没有可用模型」。
 
-插件页的目录会直接显示「自动」当前会选中谁。
+插件页的目录会直接显示每个账号「自动」当前会选中谁。
 
 思考档位同样不保存在任务里，每次发送前从当次 `/v1/models` 取该模型自己的档位列表现算，模型配置变了下次发送自动跟随：
 
@@ -57,7 +58,27 @@ magpie plugin add github:YangHonghang/magpie-window-warmup
 
 ## 账号与远程 key
 
-「发送到」的账号下拉来自 magpie 的额度目录。远程 magpie 会给每把网关 key 单独发一张限额卡（供应商标成 `<p>/~keys`），插件把这些卡归并回供应商 `<p>`，账号名就是 key 名，任务里可以直接选到某把 key。窗口任务必须指定账号；其余触发可以留空由网关自动选。
+「发送到」的账号下拉来自两处，由统一账号规则合并（目录与调度器共用同一份实现）：
+
+- **key 账号**：providers.json 里该供应商启用的每把 key（第一把 key 与 `keys[]`，停用的不列），按指纹去重；显示名是 key 名，没起名的显示指纹。发送时带 `X-Magpie-Account: <供应商>#<指纹>`；只有一把启用的 key 时不带——此时候选 ID 就是供应商 id，发了反而选不中。
+- **订阅账号**：额度目录里该供应商名下的账号卡，发送时按账号名原样作为头值。
+
+远程 magpie 会给每把网关 key 单独发一张限额卡（供应商标成 `<p>/~keys`，user 是 key 名或「名字 · 打码」的形态）。插件把卡按 key 名（不分大小写、带「名字 · 」前缀也算）挂回对应的 key 账号当窗口；没起名的 key 接受无窗口——卡名是打码后的样子，插件算不出来，窗口任务对这类账号会一直报「账号的额度里没有这个窗口」。窗口任务必须指定账号；其余触发可以留空由网关自动选。旧任务里存的账号值原样保留：是 key 名的照样按名字发送，兼容升级。
+
+## 插件只读的 Magpie 数据
+
+除本地网关外插件没有任何对外连接；本地只读以下三样，全部只读不写：
+
+1. **providers.json**（Magpie 配置目录）：只取供应商的 key 名、算 key 指纹（sha256 前 5 字节的小写 hex，与 Magpie 的 keyID 同一算法）和 accountModels 配置。**key 原文算完指纹即丢**——不保存、不写日志、不进错误信息、不外传；配置文件损坏时报固定文案，绝不把文件内容带出来。
+2. **模型缓存** `<缓存目录>/models/<供应商id>.json`：Magpie 上次「获取模型」的结果。插件只读每个模型的 ID 与 Keys（能看到该模型的 key 指纹），不含 key 原文与 key 名。
+3. **网关接口**（地址取 `MAGPIE_ADDR`，默认 `http://127.0.0.1:3425`）：`/v1/models` 列模型、`/v1/magpie/quotas` 读额度窗口、`/v1/chat/completions` 发预热消息。
+
+已知限制：
+
+- 插件型订阅供应商（zcode、WorkBuddy 等）在 Magpie 里不写模型缓存，只有 `/v1/models`：它们的账号不做按账号区分的模型过滤，所有账号共用同一份模型清单。
+- 订阅额度卡的供应商 id 是 agent 名：改过名的订阅供应商，目录里的账号与模型可能匹配不上。
+
+模型下拉被禁用并提示「还没有这个供应商的模型列表。请到 Magpie『供应商』里打开它，点『获取模型』。」时，就是第 2、3 样都拿不到该供应商的模型；下拉下方常驻的灰字（「模型列表来自 Magpie 上次获取的结果……」）是提醒模型清单可能是旧快照，账号和模型对不上时去 Magpie 里重新「获取模型」再刷新本页。
 
 ## 数据在哪
 
@@ -69,11 +90,11 @@ magpie plugin add github:YangHonghang/magpie-window-warmup
 
 ## 安全与端口
 
-本地服务只监听 `127.0.0.1`（默认端口 3492，可在插件设置里改）。每次启动生成随机口令，经首页注入，`/api/*` 全部要求带 `x-window-warmup-token` 头；服务同时校验 `Host` 与 `Origin`（防 DNS 重绑定），响应按沙箱框架给 CORS 与 CSP，别的页面读不到接口。除 magpie 本地网关（发消息、读额度、读模型，地址取 `MAGPIE_ADDR`，默认 `http://127.0.0.1:3425`）外没有任何对外连接。
+本地服务只监听 `127.0.0.1`（默认端口 3492，可在插件设置里改）。每次启动生成随机口令，经首页注入，`/api/*` 全部要求带 `x-window-warmup-token` 头；服务同时校验 `Host` 与 `Origin`（防 DNS 重绑定），响应按沙箱框架给 CORS 与 CSP，别的页面读不到接口。所有响应都带 `x-window-warmup: 1` 自标记：启动前插件先探测端口，已有本插件的服务在跑就直接复用，不重开数据目录。除 magpie 本地网关（发消息、读额度、读模型）外没有任何对外连接。
 
 ## 费用
 
-每条消息都会真实发给所选模型并计费（固定 `max_tokens: 16`，只当探活）。窗口触发以 magpie 额度快照为准，同一轮窗口只发一次；额度缓存长时间不更新时，空闲窗口按小时计 key，同一小时内最多尝试一次。
+每条消息都会真实发给所选模型并计费（内容固定 `hi`、`max_tokens: 16`，只当探活）。窗口触发以 magpie 额度快照为准，同一轮窗口只发一次；额度缓存长时间不更新时，空闲窗口按小时计 key，同一小时内最多尝试一次。
 
 ## 发布到插件页
 

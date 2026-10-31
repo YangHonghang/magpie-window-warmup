@@ -82,6 +82,9 @@ body.dark .sw.on::after { background:var(--bg); }
 .field { display:inline-flex; align-items:center; gap:5px; height:25px; padding:0 5px 0 8px; border-radius:6px; background:var(--pill); font-size:12.5px; line-height:18px; max-width:100%; min-width:0; transition:background .12s, box-shadow .12s; }
 .field:hover { background:var(--pill-hover); }
 .field.open { background:var(--pill-hover); box-shadow:inset 0 0 0 1px var(--accent); }
+/* 禁用的下拉（如该账号没有任何模型列表）只展示当前值：去 hover 反馈但保留 title 提示 */
+.field[disabled] { opacity:.5; }
+.field[disabled]:hover { background:var(--pill); box-shadow:none; }
 /* 字号不同（11.5 / 12.5）、中英文回退字体不同，按中线居中会让文字底边错开；人眼看的是基线，所以这里按基线对齐 */
 .field .kv { display:flex; align-items:baseline; gap:5px; min-width:0; flex:1 1 auto; overflow:hidden; }
 .field .k { color:var(--faint); font-size:11.5px; flex:none; }
@@ -108,6 +111,7 @@ input.text:focus, textarea.text:focus { border-color:var(--accent); box-shadow:0
 input.text::placeholder { color:var(--faint); }
 .hint { margin-top:4px; font-size:11px; color:var(--fg-2); }
 .hint.mute { color:var(--muted); }
+.hint.warn { color:var(--amber); }
 .seg { display:inline-flex; padding:2px; border-radius:8px; background:var(--pill); }
 .seg button { height:22px; padding:0 11px; border-radius:6px; font-size:12px; color:var(--ctl-fg); }
 .seg button.on { background:var(--card); color:var(--fg); box-shadow:0 1px 2px rgba(0,0,0,.14),0 0 0 .5px rgba(0,0,0,.08); }

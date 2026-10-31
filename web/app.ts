@@ -40,6 +40,12 @@ const RUNS_MAX = 50;
 /** 删除的两步确认窗口 */
 export const DELETE_CONFIRM_MS = 3000;
 
+/** 提示 A（常驻灰字）：模型列表的来源与账号对不上时的解法 */
+const MODEL_SOURCE_HINT =
+  "模型列表来自 Magpie 上次获取的结果。账号和模型对不上时，到 Magpie「供应商」里打开这个供应商，点「获取模型」，再回来刷新本页。";
+/** 提示 B：整个供应商还没有模型列表（替代提示 A，此时模型下拉禁用） */
+const NO_MODELS_HINT = "还没有这个供应商的模型列表。请到 Magpie「供应商」里打开它，点「获取模型」。";
+
 // ---------- 纯函数 ----------
 
 /** 任务当前状态字：正常不显示文字（照原型），失败不暂停，失败/未知都照常显示下次时间 */
@@ -85,9 +91,16 @@ export function runTimeLabel(iso: string, now: Date): string {
   return `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 }
 
-/** 行内副标题：触发 · 账号 · 模型（照原型，未定的给「自动」占位） */
-export function rowSub(task: Pick<Task, "trigger" | "account" | "model">): string {
-  return `${trigText(task.trigger)} · ${task.account || "自动选账号"} · ${task.model ? shortModel(task.model) : "自动选模型"}`;
+/** 行内副标题：触发 · 账号 · 模型；账号显示目录里的 label（旧值/目录暂缺用原值），未定给「自动」 */
+export function rowSub(
+  task: Pick<Task, "provider" | "trigger" | "account" | "model">,
+  providers: CatalogProvider[],
+): string {
+  const acct = providers
+    .find((p) => p.id === task.provider)
+    ?.accounts.find((a) => a.id === task.account);
+  const who = task.account ? acct?.label || task.account : "自动选账号";
+  return `${trigText(task.trigger)} · ${who} · ${task.model ? shortModel(task.model) : "自动选模型"}`;
 }
 
 export function trigText(trigger: Trigger): string {
@@ -150,7 +163,7 @@ export function runReason(r: Run): string {
   return parts.join(" · ");
 }
 
-/** 账号下拉：来自目录；窗口触发（allowAuto=false）不给自动项；目录暂缺的已存账号保留原值 */
+/** 账号下拉：来自目录；窗口触发（allowAuto=false）不给自动项；旧任务存的账号保留并标注 */
 export function accountOptions(
   providerId: string,
   current: string,
@@ -158,28 +171,66 @@ export function accountOptions(
   providers: CatalogProvider[],
 ): SelOption[] {
   const list: SelOption[] = [];
-  if (allowAuto) list.push({ value: "", text: "自动选择" });
+  if (allowAuto) list.push({ value: "", text: "自动（由 Magpie 选）" });
   const provider = providers.find((p) => p.id === providerId);
   if (current && !provider?.accounts.some((a) => a.id === current)) {
-    list.push({ value: current, text: current });
+    list.push({ value: current, text: `${current}（不在当前账号列表）` });
   }
   for (const a of provider?.accounts ?? []) {
-    list.push({ value: a.id, text: a.label && a.label !== a.id ? `${a.label}（${a.id}）` : a.id });
+    // 起了名的 key：名字做主文字、指纹做次要附注；没起名的（label 就是指纹）与订阅账号不重复
+    if (a.kind === "key" && a.label && a.label !== a.id) list.push({ value: a.id, text: a.label, aux: a.id });
+    else list.push({ value: a.id, text: a.label || a.id });
   }
   if (!list.length) list.push({ value: "", text: "该供应商没有账号" });
   return list;
 }
 
-/** 模型下拉：首项「自动」附注「小模型优先」；目录暂缺的已存模型保留原值 */
-export function modelOptions(providerId: string, current: string, providers: CatalogProvider[]): SelOption[] {
-  const list: SelOption[] = [{ value: "", text: "自动", aux: "小模型优先" }];
+/** 当前账号的模型视图：models 是下拉的可选列表，autoModel 是「自动」项实际会选中的模型 */
+export interface AccountModelView {
+  /** null = 没有任何模型列表（提示 B，模型下拉禁用） */
+  models: string[] | null;
+  /** models 为 null 或空时为 null */
+  autoModel: string | null;
+  /** false = 该账号列的是全部模型（供应商没有模型缓存）；null = 自动账号或目录暂缺，无从判断 */
+  perAccount: boolean | null;
+}
+
+/**
+ * 当前账号的模型视图：指定账号用其 models/autoModel；「自动（由 Magpie 选）」与目录暂缺的
+ * 旧账号退回供应商全集（autoAccountModels/autoModel）——旧账号不自动改写，也不该被禁用；
+ * 此时无法判断是否按账号区分（perAccount = null，不显示那条提示）。
+ */
+export function accountModelView(
+  provider: CatalogProvider | undefined,
+  accountId: string,
+): AccountModelView {
+  const acct = accountId ? provider?.accounts.find((a) => a.id === accountId) : undefined;
+  if (!acct) {
+    return {
+      models: provider?.autoAccountModels ?? null,
+      autoModel: provider?.autoModel ?? null,
+      perAccount: null,
+    };
+  }
+  return { models: acct.models, autoModel: acct.autoModel, perAccount: acct.perAccount };
+}
+
+/** 模型下拉：首项「自动」附注当前账号的自动模型；其余来自该账号的列表；旧值保留不自动改写 */
+export function modelOptions(
+  providerId: string,
+  accountId: string,
+  current: string,
+  providers: CatalogProvider[],
+): SelOption[] {
   const provider = providers.find((p) => p.id === providerId);
-  if (current && !provider?.models.some((m) => m.id === current)) {
-    list.push({ value: current, text: current });
-  }
-  for (const m of provider?.models ?? []) {
-    list.push({ value: m.id, text: modelDisplay(m.id, providerId) });
-  }
+  const view = accountModelView(provider, accountId);
+  const list: SelOption[] = [];
+  const auto: SelOption = { value: "", text: "自动" };
+  if (view.autoModel) auto.aux = modelDisplay(view.autoModel, providerId);
+  list.push(auto);
+  const known = view.models ?? [];
+  if (current && !known.includes(current)) list.push({ value: current, text: current });
+  for (const id of view.models ?? []) list.push({ value: id, text: modelDisplay(id, providerId) });
   return list;
 }
 
@@ -214,10 +265,11 @@ export function forceWindowAccount(providerId: string, providers: CatalogProvide
   return providers.find((p) => p.id === providerId)?.accounts[0]?.id ?? "";
 }
 
-/** 发送到下方的提示行：自动给「自动选中 X」，两种情况都给思考结论与一句说明 */
+/** 发送到下方的提示行：自动给「自动选中 X」（按所选账号），两种情况都给思考结论与一句说明 */
 export function modelHint(
   model: string,
   provider: CatalogProvider | undefined,
+  accountId: string,
 ): { main: string; sub: string } {
   const autoSub = "名字带 flash / lite / mini 的小模型优先，每次发送前重新选；思考能关就关，不能关用最低档。";
   const fixedSub = "思考档位按这个模型的配置自动决定：能关就关，不能关用最低档。";
@@ -225,8 +277,11 @@ export function modelHint(
     const m = provider?.models.find((x) => x.id === model);
     return { main: m ? effortLabel(m.effort) : "思考：目录里暂时没有这个模型", sub: fixedSub };
   }
-  const autoId = provider?.autoModel ?? null;
-  if (!autoId) return { main: "该供应商没有可用模型", sub: autoSub };
+  const autoId = accountModelView(provider, accountId).autoModel;
+  // 归因要看是谁没有：指定了账号就是该账号的列表空了（key 的模型限制与 /v1/models 对不上）
+  if (!autoId) {
+    return { main: accountId ? "这个账号没有可用模型" : "该供应商没有可用模型", sub: autoSub };
+  }
   const m = provider?.models.find((x) => x.id === autoId);
   const think = m ? effortLabel(m.effort) : "思考：目录里暂时没有这个模型";
   return { main: `自动选中 ${shortModel(autoId)} · ${think}`, sub: autoSub };
@@ -420,15 +475,14 @@ function cloneTask(t: Task): Task {
   return JSON.parse(JSON.stringify(t)) as Task;
 }
 
-/** 编辑签名：只有这七个字段会被保存 */
-function contentOf(d: Task): Pick<Task, "name" | "enabled" | "provider" | "account" | "model" | "message" | "trigger"> {
+/** 编辑签名：只有这六个字段会被保存；探活消息固定 hi，由服务端填写，页面不再收发 */
+export function contentOf(d: Task): Pick<Task, "name" | "enabled" | "provider" | "account" | "model" | "trigger"> {
   return {
     name: d.name,
     enabled: d.enabled,
     provider: d.provider,
     account: d.account,
     model: d.model,
-    message: d.message,
     trigger: d.trigger,
   };
 }
@@ -538,12 +592,23 @@ function closePop(): void {
 /**
  * 下拉按钮：key/值/附注按基线对齐，值超长省略、附注不截断，悬停 title 给全文；
  * 菜单挂 body 上（轮询重建列表不会关掉它），跟随按钮放置、贴边往回收，键盘可用。
+ * disabled 时按钮只展示当前值（如该账号没有任何模型列表，见提示 B）。
  */
-function sel(label: string, opts: SelOption[], val: string, onchange: (v: string) => void): HTMLButtonElement {
+function sel(
+  label: string,
+  opts: SelOption[],
+  val: string,
+  onchange: (v: string) => void,
+  disabled = false,
+): HTMLButtonElement {
   const b = el("button", "field") as HTMLButtonElement;
   b.type = "button";
-  b.setAttribute("aria-haspopup", "listbox");
-  b.setAttribute("aria-expanded", "false");
+  if (disabled) b.disabled = true;
+  else {
+    // 禁用时不声明弹层，免得读屏播报一个打不开的菜单
+    b.setAttribute("aria-haspopup", "listbox");
+    b.setAttribute("aria-expanded", "false");
+  }
   const cur = opts.find((o) => o.value === val) ?? opts[0];
   const kv = el("span", "kv");
   if (label) kv.append(el("span", "k", label));
@@ -659,7 +724,6 @@ function timezoneOptions(): SelOption[] {
 
 interface EditorRefs {
   name: HTMLInputElement;
-  msg: HTMLTextAreaElement;
 }
 
 let f: EditorRefs | null = null;
@@ -668,16 +732,15 @@ function markDirty(): void {
   dirty = true;
 }
 
-/** 名称 / 消息的输入处理：首次改动才重建（出现保存/取消），重建后把焦点与光标位置还回来 */
-function onTextEdit(kind: "name" | "msg", apply: () => void): void {
-  const node = kind === "name" ? f?.name : f?.msg;
-  const caret = node?.selectionStart ?? null;
+/** 名称输入：首次改动才重建（出现保存/取消），重建后把焦点与光标位置还回来 */
+function onNameInput(apply: () => void): void {
+  const caret = f?.name.selectionStart ?? null;
   apply();
   formError = null;
   if (!dirty) {
     dirty = true;
     render();
-    const again = kind === "name" ? f?.name : f?.msg;
+    const again = f?.name;
     if (again) {
       again.focus();
       const pos = Math.min(caret ?? again.value.length, again.value.length);
@@ -885,7 +948,7 @@ function buildEditor(): HTMLElement {
   name.value = d.name;
   name.maxLength = NAME_MAX; // 与校验同上限，别让 41+ 字输进去才在保存时报错
   name.placeholder = "给任务起个名字";
-  name.addEventListener("input", () => onTextEdit("name", () => {
+  name.addEventListener("input", () => onNameInput(() => {
     if (draft) draft.name = name.value;
   }));
   row(ed, "名称", name);
@@ -909,25 +972,40 @@ function buildEditor(): HTMLElement {
     render();
   }));
   if (d.trigger.kind === "window" && !d.account) d.account = forceWindowAccount(d.provider, providers);
+  /** 切账号：当前固定模型不在该账号列表里就回「自动」。打开已存任务不重置，只有主动切换才重置 */
+  const adoptAccount = (v: string): void => {
+    if (!draft) return;
+    draft.account = v;
+    if (draft.model && !accountModelView(provider, v).models?.includes(draft.model)) draft.model = "";
+  };
   const allowAuto = d.trigger.kind !== "window";
   fs.append(sel("账号", accountOptions(d.provider, d.account, allowAuto, providers), d.account, (v) => {
     markDirty();
-    if (!draft) return;
-    draft.account = v;
-    if (draft.trigger.kind === "window") {
+    adoptAccount(v);
+    if (draft && draft.trigger.kind === "window") {
       draft.trigger = { kind: "window", window: windowOptions(draft.provider, v, "", providers).find((o) => o.value)?.value ?? "" };
     }
     formError = null;
     render();
   }));
-  fs.append(sel("模型", modelOptions(d.provider, d.model, providers), d.model, (v) => {
+  const view = accountModelView(provider, d.account);
+  fs.append(sel("模型", modelOptions(d.provider, d.account, d.model, providers), d.model, (v) => {
     markDirty();
     if (draft) draft.model = v;
     formError = null;
     render();
-  }));
-  const mh = modelHint(d.model, provider);
-  const parts: HTMLElement[] = [fs, el("div", "hint", mh.main), el("div", "hint mute", mh.sub)];
+  }, view.models === null));
+  const parts: HTMLElement[] = [fs];
+  if (view.models === null) {
+    parts.push(el("div", "hint warn", NO_MODELS_HINT));
+  } else {
+    const mh = modelHint(d.model, provider, d.account);
+    parts.push(el("div", "hint", mh.main), el("div", "hint mute", mh.sub));
+    if (view.perAccount === false) {
+      parts.push(el("div", "hint mute", "这个供应商没有按账号区分的模型列表，列出的是全部模型"));
+    }
+    parts.push(el("div", "hint mute", MODEL_SOURCE_HINT));
+  }
   if (d.trigger.kind === "window") {
     parts.push(el("div", "hint mute", "跟随窗口重置时必须指定账号，每个账号的窗口各自计时。"));
   }
@@ -942,7 +1020,7 @@ function buildEditor(): HTMLElement {
       if (!draft || draft.trigger.kind === k) return;
       markDirty();
       if (k === "window") {
-        if (!draft.account) draft.account = forceWindowAccount(draft.provider, providers);
+        adoptAccount(draft.account || forceWindowAccount(draft.provider, providers));
         draft.trigger = { kind: "window", window: windowOptions(draft.provider, draft.account, "", providers).find((o) => o.value)?.value ?? "" };
       } else if (k === "daily") {
         draft.trigger = { kind: "daily", time: "06:00", timeZone: localTZ() };
@@ -1039,16 +1117,6 @@ function buildEditor(): HTMLElement {
   }
   row(ed, "触发", seg, line, nextEl);
 
-  // 消息
-  const msg = el("textarea", "text") as HTMLTextAreaElement;
-  msg.rows = 1;
-  msg.maxLength = 200;
-  msg.value = d.message;
-  msg.addEventListener("input", () => onTextEdit("msg", () => {
-    if (draft) draft.message = msg.value;
-  }));
-  row(ed, "消息", msg, el("div", "hint mute", "回复最多 16 个 token；30 秒没结果记为「结果未知」，不会自动重发。"));
-
   // 操作行：删除靠左；有未保存修改才出现提示、取消与保存
   const act = el("div", "actions full");
   const del = el("button", "btn danger", saved ? (deleteArmed(confirmDeleteAt, Date.now()) ? "确认删除" : "删除") : "放弃") as HTMLButtonElement;
@@ -1115,13 +1183,13 @@ function buildEditor(): HTMLElement {
   }
   box.append(runsBox);
   ed.append(box);
-  f = { name, msg }; // 回填 refs：重建后的焦点/光标恢复与校验聚焦都靠它
+  f = { name }; // 回填 refs：重建后的焦点/光标恢复与校验聚焦都靠它
   return ed;
 }
 
 // ---------- 列表与顶栏 ----------
 
-/** 行视图签名：已存任务看服务端版本，展开中的任务看草稿的结构字段（名称/消息不算，避免打字重建） */
+/** 行视图签名：已存任务看服务端版本，展开中的任务看草稿的结构字段（名称不算，避免打字重建） */
 function draftDisplaySig(): string | null {
   if (!draft) return null;
   const d = draft;
@@ -1129,11 +1197,21 @@ function draftDisplaySig(): string | null {
 }
 
 function catalogSig(): string {
+  // 页面渲染吃到的目录字段都在这里：账号的模型列表/自动模型/perAccount 变了也要重建下拉与提示
   return JSON.stringify(
     (catalog?.providers ?? []).map((p) => [
       p.id,
       p.autoModel,
-      p.accounts.map((a) => [a.id, a.label, a.windows.map((w) => [w.name, w.used, w.resetsAt])]),
+      p.autoAccountModels,
+      p.accounts.map((a) => [
+        a.id,
+        a.label,
+        a.kind,
+        a.perAccount,
+        a.autoModel,
+        a.models,
+        a.windows.map((w) => [w.name, w.used, w.resetsAt]),
+      ]),
       p.models.map((m) => m.id),
     ]),
   );
@@ -1152,7 +1230,7 @@ function rowEl(view: Task, saved: Task | null, isOpen: boolean): HTMLElement {
   r.setAttribute("role", "button");
   r.setAttribute("aria-expanded", isOpen ? "true" : "false");
   const who = el("div", "who");
-  who.append(el("div", "name", view.name || "未命名任务"), el("div", "sub", rowSub(view)));
+  who.append(el("div", "name", view.name || "未命名任务"), el("div", "sub", rowSub(view, catalog?.providers ?? [])));
   const when = el("div", "when");
   if (view.enabled) {
     const at = saved ? state?.next[saved.id] ?? null : null;

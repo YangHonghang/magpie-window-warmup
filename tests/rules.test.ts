@@ -280,8 +280,13 @@ describe("validateTask", () => {
     expect("error" in r && r.field === "anchor").toBe(true);
   });
 
-  test("message 超过 200 字 → field message", () => {
-    const r = validateTask({ ...base, message: "字".repeat(201) }, now);
-    expect("error" in r && r.field === "message").toBe(true);
+  test("message 字段忽略，一律存 hi（旧长度校验不再存在）", () => {
+    const long = validateTask({ ...base, message: "字".repeat(201) }, now);
+    expect("task" in long).toBe(true);
+    if ("task" in long) expect(long.task.message).toBe("hi");
+    // 类型不对的字段同样忽略
+    const weird = validateTask({ ...base, message: 42 }, now);
+    expect("task" in weird).toBe(true);
+    if ("task" in weird) expect(weird.task.message).toBe("hi");
   });
 });

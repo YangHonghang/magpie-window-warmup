@@ -1,7 +1,320 @@
 // @bun
 // src/plugin.ts
-import { homedir as homedir2 } from "os";
-import { join as join3 } from "path";
+import { homedir as homedir3 } from "os";
+import { join as join4 } from "path";
+
+// src/accounts.ts
+var FINGERPRINT_RE = /^[0-9a-f]{10}$/;
+var MASKED_SEP = " \xB7 ";
+var isFingerprint = (v) => FINGERPRINT_RE.test(v);
+var AUTO_SPEC_WORDS = ["flash", "lite", "mini", "nano", "small", "turbo"];
+var AUTO_SPEC_RES = AUTO_SPEC_WORDS.map((w) => new RegExp(`\\b${w}\\b`, "i"));
+function specTier(id) {
+  const seg = id.slice(id.lastIndexOf("/") + 1);
+  let best = AUTO_SPEC_WORDS.length;
+  for (let i = 0;i < AUTO_SPEC_RES.length; i++) {
+    if (i < best && AUTO_SPEC_RES[i].test(seg))
+      best = i;
+  }
+  return best;
+}
+function cmpNewerDesc(a, b) {
+  const ta = a.toLowerCase().match(/\d+|\D+/g) ?? [];
+  const tb = b.toLowerCase().match(/\d+|\D+/g) ?? [];
+  for (let i = 0;i < Math.max(ta.length, tb.length); i++) {
+    const x = ta[i];
+    const y = tb[i];
+    if (x === undefined)
+      return 1;
+    if (y === undefined)
+      return -1;
+    const nx = /^\d+$/.test(x);
+    const ny = /^\d+$/.test(y);
+    if (nx && ny) {
+      const d = Number(y) - Number(x);
+      if (d !== 0)
+        return d;
+    } else if (nx !== ny) {
+      return nx ? -1 : 1;
+    } else if (x !== y) {
+      return y < x ? 1 : -1;
+    }
+  }
+  return 0;
+}
+function pickAutoModel(models) {
+  if (models.length === 0)
+    return null;
+  const decorated = models.map((m, i) => ({ m, tier: specTier(m.id), i }));
+  decorated.sort((a, b) => a.tier - b.tier || cmpNewerDesc(a.m.id, b.m.id) || a.i - b.i);
+  return decorated[0].m;
+}
+var byId = (a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+function keepWindows(windows) {
+  return windows.filter((w) => w.unlimited !== true);
+}
+function windowsForAccount(provider, account, quotas, keyDir) {
+  const login = quotas.find((q) => q.provider === provider && !q.viaKey && q.account === account);
+  if (login)
+    return keepWindows(login.windows);
+  const name = isFingerprint(account) ? keyDir?.get(provider)?.keys.find((k) => k.fingerprint === account)?.name ?? null : account;
+  if (name === null)
+    return null;
+  if (name === "")
+    return [];
+  const low = name.toLowerCase();
+  const card = quotas.find((q) => q.provider === provider && q.viaKey && (q.account.toLowerCase() === low || q.account.startsWith(`${name}${MASKED_SEP}`)));
+  return card ? keepWindows(card.windows) : [];
+}
+function candidatesOf(provider, models, cache) {
+  if (cache) {
+    return cache.map((c) => ({ full: `${provider}/${c.id}`, bare: c.id, keys: c.keys }));
+  }
+  const prefix = `${provider}/`;
+  return models.map((m) => ({
+    full: m,
+    bare: m.startsWith(prefix) ? m.slice(prefix.length) : m,
+    keys: null
+  }));
+}
+function modelsForAccount(provider, account, input) {
+  const hasCache = input.cache !== null;
+  if (!hasCache && input.models.length === 0)
+    return { list: null, perAccount: false };
+  let cands = candidatesOf(provider, input.models, input.cache);
+  if (hasCache && isFingerprint(account)) {
+    cands = cands.filter((c) => !c.keys || c.keys.length === 0 || c.keys.includes(account));
+  }
+  const filterKey = isFingerprint(account) ? account : account.toLowerCase();
+  const allowed = input.keyDir?.get(provider)?.accountModels[filterKey];
+  if (allowed && allowed.length > 0) {
+    const set = new Set(allowed);
+    cands = cands.filter((c) => set.has(c.bare));
+  }
+  const present = new Set(input.models);
+  const list = cands.map((c) => c.full).filter((id) => present.has(id)).sort();
+  return { list, perAccount: hasCache };
+}
+function accountsOf(provider, input) {
+  const entry = input.keyDir?.get(provider) ?? null;
+  const accounts = [];
+  const seenFingerprints = new Set;
+  for (const k of entry?.keys ?? []) {
+    if (seenFingerprints.has(k.fingerprint))
+      continue;
+    seenFingerprints.add(k.fingerprint);
+    accounts.push({
+      id: k.fingerprint,
+      label: k.name || k.fingerprint,
+      kind: "key",
+      windows: windowsForAccount(provider, k.fingerprint, input.quotas, input.keyDir) ?? [],
+      ...pickModels(provider, k.fingerprint, input)
+    });
+  }
+  const seenUsers = new Set;
+  for (const q of input.quotas) {
+    if (q.provider !== provider || q.viaKey)
+      continue;
+    if (seenUsers.has(q.account))
+      continue;
+    seenUsers.add(q.account);
+    accounts.push({
+      id: q.account,
+      label: q.account,
+      kind: "login",
+      windows: windowsForAccount(provider, q.account, input.quotas, input.keyDir) ?? [],
+      ...pickModels(provider, q.account, input)
+    });
+  }
+  accounts.sort(byId);
+  return { accounts, autoAccountModels: autoAccountModelsOf(provider, input) };
+}
+function pickModels(provider, account, input) {
+  const pick = modelsForAccount(provider, account, input);
+  return {
+    models: pick.list,
+    perAccount: pick.perAccount,
+    autoModel: pick.list ? pickAutoModel(pick.list.map((id) => ({ id })))?.id ?? null : null
+  };
+}
+function autoAccountModelsOf(provider, input) {
+  if (input.cache === null && input.models.length === 0)
+    return null;
+  const present = new Set(input.models);
+  return candidatesOf(provider, input.models, input.cache).map((c) => c.full).filter((id) => present.has(id)).sort();
+}
+function pinFor(provider, account, keyDir, quotas = []) {
+  if (!account)
+    return null;
+  const isLogin = quotas.some((q) => q.provider === provider && !q.viaKey && q.account === account);
+  if (isLogin)
+    return account;
+  if (isFingerprint(account)) {
+    const enabled = keyDir?.get(provider)?.keys.length ?? 2;
+    return enabled >= 2 ? `${provider}#${account}` : null;
+  }
+  return account;
+}
+
+// src/magpie-files.ts
+import { createHash } from "crypto";
+import { readFile } from "fs/promises";
+import { homedir } from "os";
+import path, { join, resolve } from "path";
+var PLUGIN_DIR_TAIL = ["plugins", "node_modules", "magpie-window-warmup", "dist"];
+var BROKEN_PROVIDERS_MESSAGE = "Magpie \u7684\u4F9B\u5E94\u5546\u914D\u7F6E\u6587\u4EF6\u8BFB\u4E0D\u51FA\u6765";
+var READ_CACHE_MS = 5000;
+function magpieDirs(env = process.env, moduleDir = import.meta.dir, p = path) {
+  const home = homedir();
+  const installConfig = p.resolve(rooted(env.XDG_CONFIG_HOME, p) ?? p.join(home, ".config"), "magpie");
+  const installCache = p.resolve(rooted(env.XDG_CACHE_HOME, p) ?? p.join(home, ".cache"), "magpie");
+  const segments = moduleDir.split(p.sep === "\\" ? /[\\/]/ : p.sep).filter((s) => s !== "");
+  const tail = segments.slice(-PLUGIN_DIR_TAIL.length);
+  const installed = tail.length === PLUGIN_DIR_TAIL.length && PLUGIN_DIR_TAIL.every((seg, i) => tail[i] === seg);
+  if (!installed)
+    return { config: installConfig, cache: installCache };
+  const config = p.resolve(moduleDir, ...PLUGIN_DIR_TAIL.map(() => ".."));
+  return {
+    config,
+    cache: p.resolve(config) === installConfig ? installCache : p.join(config, "cache")
+  };
+}
+function rooted(v, p) {
+  const t = v?.trim();
+  return t && p.isAbsolute(t) ? t : null;
+}
+function keyFingerprint(key) {
+  return createHash("sha256").update(key, "utf8").digest("hex").slice(0, 10);
+}
+function asStringArray(v) {
+  return Array.isArray(v) && v.every((x) => typeof x === "string") ? v : null;
+}
+function entryOf(raw) {
+  if (typeof raw !== "object" || raw === null)
+    return null;
+  const pr = raw;
+  if (typeof pr.id !== "string" || !pr.id)
+    return null;
+  const keys = [];
+  const seen = new Set;
+  const push = (key, name) => {
+    if (typeof key !== "string" || !key)
+      return;
+    const fingerprint = keyFingerprint(key);
+    if (seen.has(fingerprint))
+      return;
+    seen.add(fingerprint);
+    keys.push({ fingerprint, name: typeof name === "string" ? name : "" });
+  };
+  push(pr.key, pr.keyName);
+  if (Array.isArray(pr.keys)) {
+    for (const k of pr.keys) {
+      if (typeof k !== "object" || k === null)
+        continue;
+      const rec = k;
+      if (rec.off === true)
+        continue;
+      push(rec.key, rec.name);
+    }
+  }
+  const accountModels = {};
+  if (typeof pr.accountModels === "object" && pr.accountModels !== null) {
+    for (const [k, v] of Object.entries(pr.accountModels)) {
+      const list = asStringArray(v);
+      if (list)
+        accountModels[k] = list;
+    }
+  }
+  return { keys, accountModels };
+}
+var readCache = new Map;
+function cached(key, load, worth) {
+  const hit = readCache.get(key);
+  if (hit && Date.now() - hit.at < READ_CACHE_MS && worth(hit.value)) {
+    return Promise.resolve(hit.value);
+  }
+  return load().then((value) => {
+    if (worth(value))
+      readCache.set(key, { at: Date.now(), value });
+    return value;
+  });
+}
+function readKeyDirectory(configDir) {
+  const file = resolve(join(configDir, "providers.json"));
+  return cached(file, async () => {
+    let raw;
+    try {
+      raw = await readFile(file, "utf8");
+    } catch (e) {
+      if (e.code === "ENOENT")
+        return new Map;
+      throw new Error(BROKEN_PROVIDERS_MESSAGE);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(BROKEN_PROVIDERS_MESSAGE);
+    }
+    const map = new Map;
+    const providers = parsed?.providers;
+    if (Array.isArray(providers)) {
+      for (const item of providers) {
+        const entry = entryOf(item);
+        if (entry) {
+          const id = item.id;
+          const prev = map.get(id);
+          if (prev) {
+            for (const k of entry.keys) {
+              if (!prev.keys.some((x) => x.fingerprint === k.fingerprint))
+                prev.keys.push(k);
+            }
+            Object.assign(prev.accountModels, entry.accountModels);
+          } else {
+            map.set(id, entry);
+          }
+        }
+      }
+    }
+    return map;
+  }, (v) => v.size > 0);
+}
+function readModelCache(cacheDir, providerId) {
+  if (!providerId || providerId.includes("/") || providerId.includes("\\") || providerId.includes("..")) {
+    return Promise.resolve(null);
+  }
+  const file = resolve(join(cacheDir, "models", `${providerId}.json`));
+  return cached(file, async () => {
+    let raw;
+    try {
+      raw = await readFile(file, "utf8");
+    } catch {
+      return null;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+    const models = parsed?.models;
+    if (!Array.isArray(models))
+      return null;
+    const out = [];
+    for (const item of models) {
+      if (typeof item !== "object" || item === null)
+        return null;
+      const rec = item;
+      if (typeof rec.ID !== "string" || !rec.ID)
+        return null;
+      const keys = rec.Keys === undefined || rec.Keys === null ? [] : asStringArray(rec.Keys);
+      if (!keys)
+        return null;
+      out.push({ id: rec.ID, keys });
+    }
+    return out;
+  }, (v) => v !== null);
+}
 
 // src/gateway.ts
 var DEFAULT_GATEWAY = "http://127.0.0.1:3425";
@@ -95,14 +408,14 @@ function errorReason(text) {
   } catch {}
   return text.trim().slice(0, REASON_MAX) || "\u4E0A\u6E38\u672A\u8FD4\u56DE\u9519\u8BEF\u8BF4\u660E";
 }
+function errText(e) {
+  return e instanceof Error ? e.message : String(e);
+}
 async function requestJSON(base, path, signal, timeoutMs = READ_TIMEOUT_MS) {
   const timeout = AbortSignal.timeout(timeoutMs);
-  let res;
-  try {
-    res = await fetch(base + path, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
-  } catch {
-    throw new Error(`\u8FDE\u4E0D\u4E0A Magpie\uFF08${base}\uFF09`);
-  }
+  const res = await fetch(base + path, {
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout
+  });
   const text = await res.text().catch(() => "");
   if (!res.ok)
     throw new Error(`HTTP ${res.status}\uFF1A${errorReason(text)}`);
@@ -120,16 +433,19 @@ function dataArray(data) {
   }
   return [];
 }
-function coerceWindow(w) {
-  const raw = typeof w === "object" && w !== null ? w : {};
-  return {
-    name: typeof raw.name === "string" ? raw.name : "",
-    used: typeof raw.used === "number" ? raw.used : null,
-    resetsAt: typeof raw.resetsAt === "string" ? raw.resetsAt : null
-  };
-}
-function quotaProvider(raw) {
-  return raw.endsWith("/~keys") ? raw.slice(0, -"/~keys".length) : raw;
+function coerceWindows(list) {
+  const out = [];
+  for (const w of Array.isArray(list) ? list : []) {
+    const raw = typeof w === "object" && w !== null ? w : {};
+    if (raw.unlimited === true)
+      continue;
+    out.push({
+      name: typeof raw.name === "string" ? raw.name : "",
+      used: typeof raw.used === "number" ? raw.used : null,
+      resetsAt: typeof raw.resetsAt === "string" ? raw.resetsAt : null
+    });
+  }
+  return out;
 }
 function parseQuotas(data) {
   const entries = [];
@@ -137,7 +453,9 @@ function parseQuotas(data) {
     if (typeof item !== "object" || item === null)
       continue;
     const q = item;
-    const provider = quotaProvider(typeof q.provider === "string" ? q.provider : "");
+    const rawProvider = typeof q.provider === "string" ? q.provider : "";
+    const viaKey = rawProvider.endsWith("/~keys");
+    const provider = viaKey ? rawProvider.slice(0, -"/~keys".length) : rawProvider;
     const user = typeof q.user === "string" ? q.user : "";
     if (!provider || !user)
       continue;
@@ -145,7 +463,8 @@ function parseQuotas(data) {
       provider,
       account: user,
       label: typeof q.name === "string" && q.name ? q.name : user,
-      windows: (Array.isArray(q.windows) ? q.windows : []).map(coerceWindow)
+      windows: coerceWindows(q.windows),
+      viaKey
     });
   }
   return entries;
@@ -197,48 +516,6 @@ function modelProvider(m) {
   const owner = typeof m.owned_by === "string" ? m.owned_by.trim() : "";
   return owner || (m.id.includes("/") ? m.id.slice(0, m.id.indexOf("/")) : "");
 }
-var AUTO_SPEC_WORDS = ["flash", "lite", "mini", "nano", "small", "turbo"];
-var AUTO_SPEC_RES = AUTO_SPEC_WORDS.map((w) => new RegExp(`\\b${w}\\b`, "i"));
-function specTier(id) {
-  const seg = id.slice(id.lastIndexOf("/") + 1);
-  let best = AUTO_SPEC_WORDS.length;
-  for (let i = 0;i < AUTO_SPEC_RES.length; i++) {
-    if (i < best && AUTO_SPEC_RES[i].test(seg))
-      best = i;
-  }
-  return best;
-}
-function cmpNewerDesc(a, b) {
-  const ta = a.toLowerCase().match(/\d+|\D+/g) ?? [];
-  const tb = b.toLowerCase().match(/\d+|\D+/g) ?? [];
-  for (let i = 0;i < Math.max(ta.length, tb.length); i++) {
-    const x = ta[i];
-    const y = tb[i];
-    if (x === undefined)
-      return 1;
-    if (y === undefined)
-      return -1;
-    const nx = /^\d+$/.test(x);
-    const ny = /^\d+$/.test(y);
-    if (nx && ny) {
-      const d = Number(y) - Number(x);
-      if (d !== 0)
-        return d;
-    } else if (nx !== ny) {
-      return nx ? -1 : 1;
-    } else if (x !== y) {
-      return y < x ? 1 : -1;
-    }
-  }
-  return 0;
-}
-function pickAutoModel(models) {
-  if (models.length === 0)
-    return null;
-  const decorated = models.map((m, i) => ({ m, tier: specTier(m.id), i }));
-  decorated.sort((a, b) => a.tier - b.tier || cmpNewerDesc(a.m.id, b.m.id) || a.i - b.i);
-  return decorated[0].m;
-}
 async function fetchCatalog(base) {
   const [modelsData, quotas] = await Promise.all([
     requestJSON(base, "/v1/models"),
@@ -249,7 +526,7 @@ async function fetchCatalog(base) {
   const ensure = (id) => {
     let p = providers.get(id);
     if (!p) {
-      p = { id, accounts: [], models: [], autoModel: null };
+      p = { id, accounts: [], models: [], autoAccountModels: null, autoModel: null };
       providers.set(id, p);
     }
     return p;
@@ -270,20 +547,32 @@ async function fetchCatalog(base) {
     else
       rawModels.set(pid, [m]);
   }
-  const seenAccounts = new Set;
-  for (const q of quotas.entries) {
-    const key = `${q.provider}/${q.account}`;
-    if (seenAccounts.has(key))
-      continue;
-    seenAccounts.add(key);
-    ensure(q.provider).accounts.push({ id: q.account, label: q.label, windows: q.windows });
-  }
+  for (const q of quotas.entries)
+    ensure(q.provider);
+  const dirs = magpieDirs();
+  const keyDir = await readKeyDirectory(dirs.config).catch(() => null);
+  const caches = new Map;
+  const cacheOf = async (pid) => {
+    let c = caches.get(pid);
+    if (c === undefined) {
+      c = await readModelCache(dirs.cache, pid);
+      caches.set(pid, c);
+    }
+    return c;
+  };
   const list = [...providers.values()];
   for (const p of list) {
     const raws = rawModels.get(p.id) ?? [];
     p.models = raws.map((m) => ({ id: m.id, effort: pickEffort(m) })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-    p.autoModel = pickAutoModel(raws)?.id ?? null;
-    p.accounts.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    const built = accountsOf(p.id, {
+      models: raws.map((m) => m.id),
+      quotas: quotas.entries,
+      keyDir,
+      cache: await cacheOf(p.id)
+    });
+    p.accounts = built.accounts;
+    p.autoAccountModels = built.autoAccountModels;
+    p.autoModel = built.autoAccountModels ? pickAutoModel(built.autoAccountModels.map((id) => ({ id })))?.id ?? null : null;
   }
   list.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   return { providers: list };
@@ -296,7 +585,8 @@ function usableChatBody(text) {
     return false;
   }
 }
-async function send(base, task, effort, signal, timeoutMs = SEND_TIMEOUT_MS) {
+var WARMUP_MESSAGE = "hi";
+async function send(base, task, pin, effort, signal, timeoutMs = SEND_TIMEOUT_MS) {
   const startedAt = Date.now();
   const elapsed = () => Date.now() - startedAt;
   const timer = AbortSignal.timeout(timeoutMs);
@@ -305,11 +595,12 @@ async function send(base, task, effort, signal, timeoutMs = SEND_TIMEOUT_MS) {
     "content-type": "application/json",
     "x-magpie-session": `window-warmup/${task.id}`
   };
-  if (task.account)
-    headers["x-magpie-account"] = task.account;
+  if (pin) {
+    headers["x-magpie-account"] = /[^\x00-\x7F]/.test(pin) ? Buffer.from(pin, "utf8").toString("latin1") : pin;
+  }
   const body = {
     model: task.model,
-    messages: [{ role: "user", content: task.message }],
+    messages: [{ role: "user", content: WARMUP_MESSAGE }],
     max_tokens: SEND_MAX_TOKENS,
     stream: false
   };
@@ -332,7 +623,7 @@ async function send(base, task, effort, signal, timeoutMs = SEND_TIMEOUT_MS) {
     if (code === "ECONNRESET" || code === "EPIPE") {
       return { outcome: "unknown", reason: "\u8FDE\u63A5\u4E2D\u65AD\uFF0C\u7ED3\u679C\u672A\u77E5\uFF08\u53EF\u80FD\u5DF2\u53D1\u9001\uFF09", ms: elapsed() };
     }
-    return { outcome: "failed", reason: `\u8FDE\u4E0D\u4E0A Magpie\uFF08${base}\uFF09`, ms: elapsed() };
+    return { outcome: "failed", reason: errText(e), ms: elapsed() };
   }
   let text = "";
   let bodyBroken = false;
@@ -353,8 +644,8 @@ async function send(base, task, effort, signal, timeoutMs = SEND_TIMEOUT_MS) {
 
 // src/server.ts
 import { randomBytes, timingSafeEqual } from "crypto";
-import { readFile as readFile2 } from "fs/promises";
-import path, { basename, extname, join as join2, resolve } from "path";
+import { readFile as readFile3 } from "fs/promises";
+import path2, { basename, extname, join as join3, resolve as resolve2 } from "path";
 
 // src/rules.ts
 var MINUTE_MS = 60000;
@@ -362,7 +653,6 @@ var HOUR_MS = 3600000;
 var RESET_GRACE_MS = 30000;
 var LAST_DUE_LOOKBACK_MS = 48 * HOUR_MS;
 var NAME_MAX = 40;
-var MESSAGE_MAX = 200;
 var formatters = new Map;
 function formatter(timeZone) {
   let f = formatters.get(timeZone);
@@ -581,16 +871,7 @@ function validateTask(input, now) {
   const model = typeof raw.model === "string" ? raw.model.trim() : "";
   if (model.startsWith("group/"))
     return { error: "\u4E0D\u652F\u6301\u8DEF\u7531\u7EC4\u6A21\u578B", field: "model" };
-  let message = "hi";
-  if (raw.message !== undefined && raw.message !== null) {
-    if (typeof raw.message !== "string")
-      return { error: "\u6D88\u606F\u5185\u5BB9\u5FC5\u987B\u662F\u6587\u672C", field: "message" };
-    const len = [...raw.message].length;
-    if (len < 1 || len > MESSAGE_MAX) {
-      return { error: `\u6D88\u606F\u5185\u5BB9\u9700\u4E3A 1\u2013${MESSAGE_MAX} \u5B57`, field: "message" };
-    }
-    message = raw.message;
-  }
+  const message = WARMUP_MESSAGE;
   let enabled = true;
   if (raw.enabled !== undefined && raw.enabled !== null) {
     if (typeof raw.enabled !== "boolean")
@@ -667,15 +948,7 @@ var DISABLED_REASON = "\u4EFB\u52A1\u5DF2\u505C\u7528\uFF0C\u53D1\u9001\u88AB\u5
 var DELETED_REASON = "\u4EFB\u52A1\u5DF2\u5220\u9664\uFF0C\u53D1\u9001\u88AB\u53D6\u6D88";
 var CONFLICT_MESSAGE = "\u4E0A\u4E00\u6B21\u53D1\u9001\u8FD8\u6CA1\u7ED3\u675F\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5";
 var NOT_FOUND_MESSAGE = "\u4EFB\u52A1\u4E0D\u5B58\u5728";
-function resolveSendModel(models, task) {
-  if (task.model) {
-    const model = models.find((m) => m.id === task.model);
-    return model ? { id: task.model, model } : { error: `\u6A21\u578B ${task.model} \u5DF2\u4E0D\u5728 Magpie \u7684\u6A21\u578B\u5217\u8868\u91CC` };
-  }
-  const pick = pickAutoModel(models.filter((m) => modelProvider(m) === task.provider));
-  return pick ? { id: pick.id, model: pick } : { error: `\u4F9B\u5E94\u5546 ${task.provider} \u4E0B\u6CA1\u6709\u53EF\u7528\u6A21\u578B` };
-}
-function errText(e) {
+function errText2(e) {
   return e instanceof Error ? e.message : String(e);
 }
 
@@ -687,6 +960,8 @@ class Scheduler {
   sendFn;
   quotasFn;
   modelsFn;
+  keyDirFn;
+  modelCacheFn;
   started = false;
   chain = Promise.resolve();
   background = [];
@@ -695,6 +970,7 @@ class Scheduler {
   armedFor = new Map;
   inflight = new Map;
   quota = null;
+  keyDirMap = null;
   quotaStale = false;
   quotaTried = false;
   saveError = null;
@@ -710,6 +986,9 @@ class Scheduler {
     this.sendFn = deps.sendFn ?? send;
     this.quotasFn = deps.quotasFn ?? fetchQuotas;
     this.modelsFn = deps.modelsFn ?? fetchModels;
+    const dirs = magpieDirs();
+    this.keyDirFn = deps.keyDirFn ?? (() => readKeyDirectory(dirs.config).catch(() => null));
+    this.modelCacheFn = deps.modelCacheFn ?? ((pid) => readModelCache(dirs.cache, pid));
   }
   start() {
     this.started = true;
@@ -904,7 +1183,7 @@ class Scheduler {
       this.saveError = null;
       return true;
     }, (e) => {
-      this.saveError = errText(e);
+      this.saveError = errText2(e);
       return false;
     });
     this.lastWrite = p.then(() => {});
@@ -935,7 +1214,7 @@ class Scheduler {
         else
           await this.evaluateFixed(task, now);
       } catch (e) {
-        const reason = `\u8C03\u5EA6\u51FA\u9519\uFF1A${errText(e)}`;
+        const reason = `\u8C03\u5EA6\u51FA\u9519\uFF1A${errText2(e)}`;
         const key = `${hourFloorISO(now)}|${reason}`;
         if (this.lastErrKey.get(task.id) !== key) {
           this.lastErrKey.set(task.id, key);
@@ -992,11 +1271,11 @@ class Scheduler {
       return null;
     if (!task.account)
       return { at: snap.at, error: "\u7A97\u53E3\u4EFB\u52A1\u6CA1\u6709\u6307\u5B9A\u8D26\u53F7" };
-    const entry = snap.entries.find((e) => e.provider === task.provider && e.account === task.account);
-    if (!entry)
+    const windows = windowsForAccount(task.provider, task.account, snap.entries, this.keyDirMap);
+    if (windows === null)
       return { at: snap.at, error: `\u989D\u5EA6\u91CC\u6CA1\u6709\u8D26\u53F7 ${task.account}` };
     const windowName = task.trigger.kind === "window" ? task.trigger.window : "";
-    const win = entry.windows.find((w) => w.name === windowName);
+    const win = windows.find((w) => w.name === windowName);
     const due = windowDue(win, snap.at);
     if ("error" in due)
       return { at: snap.at, error: due.error };
@@ -1008,14 +1287,19 @@ class Scheduler {
   }
   async refreshQuotas() {
     const now = this.nowFn();
-    if (this.quota && !this.quotaStale && now.getTime() - this.quota.at.getTime() < QUOTA_REFRESH_MS) {
+    const quotaFresh = this.quota !== null && !this.quotaStale && now.getTime() - this.quota.at.getTime() < QUOTA_REFRESH_MS;
+    if (quotaFresh && this.keyDirMap !== null)
       return;
-    }
     this.quotaTried = true;
-    try {
-      this.quota = await this.quotasFn(this.base);
+    const [keyDir, snap] = await Promise.all([
+      this.keyDirFn().then((m) => m, () => this.keyDirMap),
+      quotaFresh ? Promise.resolve(this.quota) : this.quotasFn(this.base).catch(() => null)
+    ]);
+    this.keyDirMap = keyDir;
+    if (snap) {
+      this.quota = snap;
       this.quotaStale = false;
-    } catch {
+    } else if (!quotaFresh) {
       this.quotaStale = true;
     }
   }
@@ -1052,6 +1336,31 @@ class Scheduler {
     await savedRunning;
     return run;
   }
+  async resolveSend(task, models) {
+    const [keyDir, cache] = await Promise.all([
+      this.keyDirFn().catch(() => null),
+      this.modelCacheFn(task.provider).catch(() => null)
+    ]);
+    const pin = pinFor(task.provider, task.account, keyDir, this.quota?.entries ?? []);
+    if (task.model) {
+      const model = models.find((m) => m.id === task.model);
+      return model ? { id: task.model, model, pin } : { error: `\u6A21\u578B ${task.model} \u5DF2\u4E0D\u5728 Magpie \u7684\u6A21\u578B\u5217\u8868\u91CC` };
+    }
+    const ids = models.filter((m) => modelProvider(m) === task.provider).map((m) => m.id);
+    const list = modelsForAccount(task.provider, task.account, { models: ids, keyDir, cache }).list;
+    if (list === null) {
+      return { error: `\u4F9B\u5E94\u5546 ${task.provider} \u8FD8\u6CA1\u6709\u6A21\u578B\u5217\u8868\uFF0C\u65E0\u6CD5\u81EA\u52A8\u9009\u6A21\u578B` };
+    }
+    if (list.length === 0)
+      return { error: `\u8D26\u53F7 ${task.account || "\u81EA\u52A8"} \u6CA1\u6709\u53EF\u7528\u6A21\u578B` };
+    const chosen = pickAutoModel(list.map((id) => ({ id })));
+    if (!chosen)
+      return { error: `\u8D26\u53F7 ${task.account || "\u81EA\u52A8"} \u6CA1\u6709\u53EF\u7528\u6A21\u578B` };
+    const model = models.find((m) => m.id === chosen.id);
+    if (!model)
+      return { error: `\u6A21\u578B ${chosen.id} \u5DF2\u4E0D\u5728 Magpie \u7684\u6A21\u578B\u5217\u8868\u91CC` };
+    return { id: chosen.id, model, pin };
+  }
   async sendAndFinalize(task, run, entry, savedRunning) {
     try {
       const persisted = await savedRunning;
@@ -1066,7 +1375,7 @@ class Scheduler {
       } else {
         try {
           const models = await this.modelsFn(this.base, entry.abort.signal);
-          const resolved = resolveSendModel(models, task);
+          const resolved = await this.resolveSend(task, models);
           if ("error" in resolved) {
             result = { outcome: "failed", reason: resolved.error, ms: 0 };
           } else {
@@ -1076,11 +1385,11 @@ class Scheduler {
             } else {
               effort = pick.send;
               run.model = resolved.id;
-              result = await this.sendFn(this.base, { id: task.id, account: task.account, model: resolved.id, message: task.message }, effort, entry.abort.signal);
+              result = await this.sendFn(this.base, { id: task.id, model: resolved.id }, resolved.pin, effort, entry.abort.signal);
             }
           }
         } catch (e) {
-          result = { outcome: "failed", reason: errText(e), ms: 0 };
+          result = { outcome: "failed", reason: errText2(e), ms: 0 };
         }
       }
       run.effort = effort;
@@ -1171,9 +1480,9 @@ class Scheduler {
 }
 
 // src/store.ts
-import { link, mkdir, readdir, readFile, rename, unlink, writeFile } from "fs/promises";
-import { homedir } from "os";
-import { join } from "path";
+import { link, mkdir, readdir, readFile as readFile2, rename, unlink, writeFile } from "fs/promises";
+import { homedir as homedir2 } from "os";
+import { join as join2 } from "path";
 import { randomUUID as randomUUID2 } from "crypto";
 var RUNS_PER_TASK = 50;
 var RESET_KEYS_PER_TASK = 20;
@@ -1187,7 +1496,7 @@ class StoreError extends Error {
     this.name = "StoreError";
   }
 }
-function errText2(e) {
+function errText3(e) {
   return e instanceof Error ? e.message : String(e);
 }
 function isStr(x) {
@@ -1344,21 +1653,21 @@ class StoreImpl {
 }
 async function openStore(dir) {
   await mkdir(dir, { recursive: true, mode: 448 });
-  const path = join(dir, STATE_FILE);
+  const path = join2(dir, STATE_FILE);
   let raw;
   try {
-    raw = await readFile(path, "utf8");
+    raw = await readFile2(path, "utf8");
   } catch (e) {
     if (e.code === "ENOENT") {
       return new StoreImpl({ version: 1, tasks: [], runs: [], marks: {} }, path);
     }
-    throw new StoreError(`\u72B6\u6001\u6587\u4EF6\u8BFB\u4E0D\u51FA\u6765\uFF1A${errText2(e)}`);
+    throw new StoreError(`\u72B6\u6001\u6587\u4EF6\u8BFB\u4E0D\u51FA\u6765\uFF1A${errText3(e)}`);
   }
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch (e) {
-    throw new StoreError(`\u72B6\u6001\u6587\u4EF6\u4E0D\u662F\u5408\u6CD5\u7684 JSON\uFF1A${errText2(e)}`);
+    throw new StoreError(`\u72B6\u6001\u6587\u4EF6\u4E0D\u662F\u5408\u6CD5\u7684 JSON\uFF1A${errText3(e)}`);
   }
   const problem = validateState(parsed);
   if (problem)
@@ -1372,19 +1681,19 @@ async function openStore(dir) {
   return new StoreImpl(data, path);
 }
 async function migrateLegacyState(dir, env = process.env) {
-  const statePath = join(dir, STATE_FILE);
+  const statePath = join2(dir, STATE_FILE);
   try {
-    await readFile(statePath);
+    await readFile2(statePath);
     return;
   } catch (e) {
     if (e.code !== "ENOENT")
       return;
   }
   const xdg = env.XDG_CONFIG_HOME?.trim();
-  const legacy = join(xdg || join(homedir(), ".config"), "magpie", LEGACY_DIR_NAME, STATE_FILE);
+  const legacy = join2(xdg || join2(homedir2(), ".config"), "magpie", LEGACY_DIR_NAME, STATE_FILE);
   let raw;
   try {
-    raw = await readFile(legacy, "utf8");
+    raw = await readFile2(legacy, "utf8");
   } catch {
     return;
   }
@@ -1414,7 +1723,7 @@ function pidAlive(pid) {
 async function releaseLock(path) {
   let raw;
   try {
-    raw = await readFile(path, "utf8");
+    raw = await readFile2(path, "utf8");
   } catch {
     return;
   }
@@ -1423,15 +1732,15 @@ async function releaseLock(path) {
 }
 async function acquireLock(dir) {
   await mkdir(dir, { recursive: true, mode: 448 });
-  const path = join(dir, LOCK_FILE);
+  const path = join2(dir, LOCK_FILE);
   const leftovers = await readdir(dir).catch(() => []);
   for (const name of leftovers) {
     if (/^service\.lock\.\d+\.[0-9a-f-]+\.tmp$/.test(name)) {
-      await unlink(join(dir, name)).catch(() => {});
+      await unlink(join2(dir, name)).catch(() => {});
     }
   }
   for (let round = 0;round < 3; round++) {
-    const tmp = join(dir, `${LOCK_FILE}.${process.pid}.${randomUUID2()}.tmp`);
+    const tmp = join2(dir, `${LOCK_FILE}.${process.pid}.${randomUUID2()}.tmp`);
     await writeFile(tmp, String(process.pid), { mode: 384 });
     try {
       await link(tmp, path);
@@ -1440,12 +1749,12 @@ async function acquireLock(dir) {
     } catch (e) {
       await unlink(tmp).catch(() => {});
       if (e.code !== "EEXIST") {
-        throw new Error(`\u65E0\u6CD5\u521B\u5EFA\u5355\u5B9E\u4F8B\u9501\uFF1A${errText2(e)}`);
+        throw new Error(`\u65E0\u6CD5\u521B\u5EFA\u5355\u5B9E\u4F8B\u9501\uFF1A${errText3(e)}`);
       }
     }
     let raw;
     try {
-      raw = await readFile(path, "utf8");
+      raw = await readFile2(path, "utf8");
     } catch (e) {
       if (e.code === "ENOENT")
         continue;
@@ -1465,6 +1774,7 @@ async function acquireLock(dir) {
 
 // src/server.ts
 var TOKEN_HEADER = "x-window-warmup-token";
+var MARKER_HEADER = "x-window-warmup";
 var BODY_LIMIT = 64 * 1024;
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
@@ -1472,7 +1782,7 @@ function json(data, status = 200, headers = {}) {
     headers: { "content-type": "application/json; charset=utf-8", ...headers }
   });
 }
-function errText3(e) {
+function errText4(e) {
   return e instanceof Error ? e.message : String(e);
 }
 var MIME = {
@@ -1505,12 +1815,12 @@ async function readBody(req) {
     throw new Error("\u8BF7\u6C42\u4E0D\u662F\u5408\u6CD5\u7684 JSON");
   }
 }
-function insideDir(root, file, p = path) {
+function insideDir(root, file, p = path2) {
   const rel = p.relative(root, file);
   return rel !== "" && !rel.startsWith("..") && !p.isAbsolute(rel);
 }
 async function startService(opts) {
-  const uiDir = opts.uiDir ?? resolve(import.meta.dir, basename(import.meta.dir) === "src" ? "../dist/ui" : "ui");
+  const uiDir = opts.uiDir ?? resolve2(import.meta.dir, basename(import.meta.dir) === "src" ? "../dist/ui" : "ui");
   let fatal = null;
   let store;
   try {
@@ -1539,11 +1849,14 @@ async function startService(opts) {
       hostname: "127.0.0.1",
       port: opts.port,
       async fetch(req) {
+        let res;
         try {
-          return await handle(req);
+          res = await handle(req);
         } catch (e) {
-          return json({ error: errText3(e) }, 500, corsHeaders(req.headers.get("origin")));
+          res = json({ error: errText4(e) }, 500, corsHeaders(req.headers.get("origin")));
         }
+        res.headers.set(MARKER_HEADER, "1");
+        return res;
       }
     });
   } catch (e) {
@@ -1583,7 +1896,7 @@ async function startService(opts) {
     return scheduler.snapshot();
   }
   function opError(e, cors) {
-    const msg = errText3(e);
+    const msg = errText4(e);
     if (msg === NOT_FOUND_MESSAGE)
       return json({ error: msg }, 404, cors);
     if (msg === CONFLICT_MESSAGE)
@@ -1594,7 +1907,7 @@ async function startService(opts) {
     try {
       return { value: await readBody(req) };
     } catch (e) {
-      return { error: json({ error: errText3(e) }, 400, cors) };
+      return { error: json({ error: errText4(e) }, 400, cors) };
     }
   }
   function readonlyBlock(cors) {
@@ -1616,7 +1929,7 @@ async function startService(opts) {
       try {
         return json(await fetchCatalog(opts.base), 200, cors);
       } catch (e) {
-        return json({ error: errText3(e) }, 502, cors);
+        return json({ error: errText4(e) }, 502, cors);
       }
     }
     if (fatal !== null || lockedBy !== null) {
@@ -1679,7 +1992,7 @@ async function startService(opts) {
     }).replaceAll("<", "\\u003c");
     let html;
     try {
-      html = await readFile2(join2(uiDir, "index.html"), "utf8");
+      html = await readFile3(join3(uiDir, "index.html"), "utf8");
     } catch {
       html = "<!doctype html><title>\u7A97\u53E3\u9884\u70ED</title><p>\u754C\u9762\u8FD8\u6CA1\u6784\u5EFA\uFF1A\u5148\u5728\u5305\u76EE\u5F55\u8FD0\u884C bun run build\u3002</p>";
     }
@@ -1702,8 +2015,8 @@ async function startService(opts) {
     if (url.pathname === "/" || url.pathname === "/index.html")
       return serveIndex(req, url);
     const decoded = decodeURIComponent(url.pathname);
-    const root = resolve(uiDir);
-    const file = resolve(root, `.${decoded}`);
+    const root = resolve2(uiDir);
+    const file = resolve2(root, `.${decoded}`);
     if (!insideDir(root, file) || decoded.includes("..")) {
       return new Response("\u6CA1\u6709\u8FD9\u4E2A\u6587\u4EF6", { status: 404, headers: cors });
     }
@@ -1756,30 +2069,49 @@ async function startService(opts) {
 
 // src/plugin.ts
 var DEFAULT_PORT = 3492;
+var PROBE_TIMEOUT_MS = 2000;
+var MARKER_HEADER2 = "x-window-warmup";
 function defaultDir(env = process.env) {
   const custom = env.WINDOW_WARMUP_DIR?.trim();
   if (custom)
     return custom;
   const xdg = env.XDG_CONFIG_HOME?.trim();
-  return join3(xdg || join3(homedir2(), ".config"), "magpie", "window-warmup");
+  return join4(xdg || join4(homedir3(), ".config"), "magpie", "window-warmup");
 }
-var instance;
+async function alreadyServing(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+    });
+    return res.headers.get(MARKER_HEADER2) === "1";
+  } catch {
+    return false;
+  }
+}
+var instances = new Map;
 var plugin_default = {
   id: "magpie-window-warmup",
   server: async (_input, opts = {}) => {
     const port = Number(opts?.port);
-    instance ??= (async () => {
-      const dir = defaultDir();
-      await migrateLegacyState(dir);
-      return startService({
-        port: Number.isFinite(port) && port > 0 ? port : DEFAULT_PORT,
-        dir,
-        base: gatewayBase()
+    const listen = Number.isFinite(port) && port > 0 ? port : DEFAULT_PORT;
+    if (await alreadyServing(listen))
+      return {};
+    let instance = instances.get(listen);
+    if (!instance) {
+      instance = (async () => {
+        const dir = defaultDir();
+        await migrateLegacyState(dir);
+        return startService({
+          port: listen,
+          dir,
+          base: gatewayBase()
+        });
+      })().catch((e) => {
+        instances.delete(listen);
+        throw e;
       });
-    })().catch((e) => {
-      instance = undefined;
-      throw e;
-    });
+      instances.set(listen, instance);
+    }
     await instance;
     return {};
   }

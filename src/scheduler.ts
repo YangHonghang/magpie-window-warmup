@@ -4,7 +4,15 @@
 // 收尾写回前再查任务是否存在，杜绝「删除后异步完成把记录加回来」。
 // 单个定时器，延迟 = min(最近到期 − now, 10 分钟)，每次醒来重算（抵御睡眠与改系统时间）。
 import { randomUUID } from "node:crypto";
-import { fetchModels, fetchQuotas, modelProvider, pickAutoModel, pickEffort, send } from "./gateway";
+import { modelsForAccount, pinFor, pickAutoModel, windowsForAccount } from "./accounts";
+import { fetchModels, fetchQuotas, modelProvider, pickEffort, send } from "./gateway";
+import {
+  magpieDirs,
+  readKeyDirectory,
+  readModelCache,
+  type CachedModel,
+  type KeyDirectoryEntry,
+} from "./magpie-files";
 import { hourFloorISO, lastDue, nextDaily, nextEvery, upcoming, windowDue } from "./rules";
 import type { Store } from "./store";
 import type { QuotaEntry, RawModel, Run, SendResult, Task } from "./types";
@@ -30,6 +38,10 @@ export type SendFn = typeof send;
 export type QuotasFn = typeof fetchQuotas;
 /** 取模型元数据；signal 在停用/删除时传入，中止进行中的请求（测试假件可不实现） */
 export type ModelsFn = (base: string, signal?: AbortSignal) => Promise<RawModel[]>;
+/** 读 providers.json 的 key 目录；null = 读不出（指纹账号按「≥2 把 key」处理） */
+export type KeyDirFn = () => Promise<Map<string, KeyDirectoryEntry> | null>;
+/** 读某供应商的模型缓存；null = 没有缓存文件 */
+export type ModelCacheFn = (providerId: string) => Promise<CachedModel[] | null>;
 /** 注册定时器，返回取消函数；测试注入假时钟时用它截取回调 */
 export type TimerSetter = (fn: () => void, ms: number) => () => void;
 
@@ -45,6 +57,9 @@ export interface SchedulerDeps {
   sendFn?: SendFn;
   quotasFn?: QuotasFn;
   modelsFn?: ModelsFn;
+  /** key 目录与模型缓存的读取器；缺省按 magpieDirs() 推导的默认位置读 */
+  keyDirFn?: KeyDirFn;
+  modelCacheFn?: ModelCacheFn;
 }
 
 export interface TimelinePoint {
@@ -67,21 +82,6 @@ export interface StateView {
 type QuotaSnapshot = { at: Date; entries: QuotaEntry[] };
 type WindowInfo = { at: Date; resetKey: string } | { at: Date; error: string };
 
-/** 从当次模型列表解析本次要用的模型：固定 id 直查；""（自动）在该供应商的模型里现选 */
-function resolveSendModel(
-  models: RawModel[],
-  task: Pick<Task, "provider" | "model">,
-): { id: string; model: RawModel } | { error: string } {
-  if (task.model) {
-    const model = models.find((m) => m.id === task.model);
-    return model
-      ? { id: task.model, model }
-      : { error: `模型 ${task.model} 已不在 Magpie 的模型列表里` };
-  }
-  const pick = pickAutoModel(models.filter((m) => modelProvider(m) === task.provider));
-  return pick ? { id: pick.id, model: pick } : { error: `供应商 ${task.provider} 下没有可用模型` };
-}
-
 interface Inflight {
   abort: AbortController;
   /** 停用/删除请求的取消标记；置位后收尾把记录改判 unknown */
@@ -101,6 +101,8 @@ export class Scheduler {
   private readonly sendFn: SendFn;
   private readonly quotasFn: QuotasFn;
   private readonly modelsFn: ModelsFn;
+  private readonly keyDirFn: KeyDirFn;
+  private readonly modelCacheFn: ModelCacheFn;
 
   private started = false;
   /** 操作队列：串行执行所有改状态入口，前一个失败不阻塞后一个 */
@@ -113,6 +115,8 @@ export class Scheduler {
   private armedFor = new Map<string, Date>();
   private inflight = new Map<string, Inflight>();
   private quota: QuotaSnapshot | null = null;
+  /** key 目录的最近一次读取：窗口任务的账号→窗口映射（同步路径）要用 */
+  private keyDirMap: Map<string, KeyDirectoryEntry> | null = null;
   /** 发送改变额度状态，或上次刷新失败 → 下一轮先刷新快照再判断 */
   private quotaStale = false;
   private quotaTried = false;
@@ -134,6 +138,10 @@ export class Scheduler {
     this.sendFn = deps.sendFn ?? send;
     this.quotasFn = deps.quotasFn ?? fetchQuotas;
     this.modelsFn = deps.modelsFn ?? fetchModels;
+    // 目录位置进程内不变，构造时推导一次；providers.json 损坏按「读不出」处理（null）
+    const dirs = magpieDirs();
+    this.keyDirFn = deps.keyDirFn ?? (() => readKeyDirectory(dirs.config).catch(() => null));
+    this.modelCacheFn = deps.modelCacheFn ?? ((pid) => readModelCache(dirs.cache, pid));
   }
 
   /** 启动：把遗留的 running 记录改判 unknown，再排定时器。可重复调用 */
@@ -455,13 +463,12 @@ export class Scheduler {
     const snap = this.quota;
     if (!snap) return null;
     if (!task.account) return { at: snap.at, error: "窗口任务没有指定账号" };
-    const entry = snap.entries.find(
-      (e) => e.provider === task.provider && e.account === task.account,
-    );
-    if (!entry) return { at: snap.at, error: `额度里没有账号 ${task.account}` };
+    // 账号 → 窗口走统一账号列表：key 账号用指纹反查 key 名再匹配 ~keys 卡（accounts.ts 共用实现）
+    const windows = windowsForAccount(task.provider, task.account, snap.entries, this.keyDirMap);
+    if (windows === null) return { at: snap.at, error: `额度里没有账号 ${task.account}` };
     // 回调里拿不到外层的 kind 收窄（trigger 可变），先提成常量
     const windowName = task.trigger.kind === "window" ? task.trigger.window : "";
-    const win = entry.windows.find((w) => w.name === windowName);
+    const win = windows.find((w) => w.name === windowName);
     const due = windowDue(win, snap.at);
     if ("error" in due) return { at: snap.at, error: due.error };
     // windowDue 对「resetsAt 已过」也回 idle:小时取整——同一份旧重置每小时会换个新 key，
@@ -477,14 +484,30 @@ export class Scheduler {
 
   private async refreshQuotas(): Promise<void> {
     const now = this.nowFn();
-    if (this.quota && !this.quotaStale && now.getTime() - this.quota.at.getTime() < QUOTA_REFRESH_MS) {
-      return;
-    }
+    const quotaFresh =
+      this.quota !== null &&
+      !this.quotaStale &&
+      now.getTime() - this.quota.at.getTime() < QUOTA_REFRESH_MS;
+    // 快照还新鲜但 key 目录没读到（上轮失败）：也要再补读，指纹账号的窗口映射等着它
+    if (quotaFresh && this.keyDirMap !== null) return;
     this.quotaTried = true;
-    try {
-      this.quota = await this.quotasFn(this.base);
+    // key 目录与额度快照一起等完再返回：windowInfo 是同步路径，只等额度的话，
+    // key 目录（真实文件 I/O）后到会让指纹账号在首轮误报「额度里没有账号」。
+    // key 目录读失败保留旧值（可能仍是 null），不拿失败结果盖掉上一次的好数据
+    const [keyDir, snap] = await Promise.all([
+      this.keyDirFn().then(
+        (m) => m,
+        () => this.keyDirMap,
+      ),
+      quotaFresh
+        ? Promise.resolve(this.quota)
+        : this.quotasFn(this.base).catch(() => null),
+    ]);
+    this.keyDirMap = keyDir;
+    if (snap) {
+      this.quota = snap;
       this.quotaStale = false;
-    } catch {
+    } else if (!quotaFresh) {
       // 刷新失败保留旧快照，下个周期再试；额度读不到不值得记一条失败记录
       this.quotaStale = true;
     }
@@ -529,6 +552,40 @@ export class Scheduler {
     return run;
   }
 
+  /**
+   * 发送前解析当次的账号头与模型（每次发送现取 /v1/models、key 目录与该供应商的模型缓存，
+   * 配置变了下一次发送自动跟随）。固定模型只校验仍在 /v1/models，不校验账号权限（交给服务器）；
+   * 自动模型按统一账号规则取该账号（或「自动选账号」）的可选模型列表现选。
+   */
+  private async resolveSend(
+    task: Task,
+    models: RawModel[],
+  ): Promise<{ id: string; model: RawModel; pin: string | null } | { error: string }> {
+    const [keyDir, cache] = await Promise.all([
+      this.keyDirFn().catch(() => null),
+      this.modelCacheFn(task.provider).catch(() => null),
+    ]);
+    const pin = pinFor(task.provider, task.account, keyDir, this.quota?.entries ?? []);
+    if (task.model) {
+      const model = models.find((m) => m.id === task.model);
+      return model
+        ? { id: task.model, model, pin }
+        : { error: `模型 ${task.model} 已不在 Magpie 的模型列表里` };
+    }
+    const ids = models.filter((m) => modelProvider(m) === task.provider).map((m) => m.id);
+    const list = modelsForAccount(task.provider, task.account, { models: ids, keyDir, cache }).list;
+    if (list === null) {
+      return { error: `供应商 ${task.provider} 还没有模型列表，无法自动选模型` };
+    }
+    if (list.length === 0) return { error: `账号 ${task.account || "自动"} 没有可用模型` };
+    const chosen = pickAutoModel(list.map((id) => ({ id })));
+    if (!chosen) return { error: `账号 ${task.account || "自动"} 没有可用模型` };
+    const model = models.find((m) => m.id === chosen.id);
+    // list 由第 3 层过滤过，一定还在 /v1/models 里；兜底防夹具不一致
+    if (!model) return { error: `模型 ${chosen.id} 已不在 Magpie 的模型列表里` };
+    return { id: chosen.id, model, pin };
+  }
+
   private async sendAndFinalize(
     task: Task,
     run: Run,
@@ -549,9 +606,8 @@ export class Scheduler {
         };
       } else {
         try {
-          // 每次发送都重新取模型配置：模型与档位都跟着当次目录走，任务不存它们
           const models = await this.modelsFn(this.base, entry.abort.signal);
-          const resolved = resolveSendModel(models, task);
+          const resolved = await this.resolveSend(task, models);
           if ("error" in resolved) {
             result = { outcome: "failed", reason: resolved.error, ms: 0 };
           } else {
@@ -563,7 +619,8 @@ export class Scheduler {
               run.model = resolved.id;
               result = await this.sendFn(
                 this.base,
-                { id: task.id, account: task.account, model: resolved.id, message: task.message },
+                { id: task.id, model: resolved.id },
+                resolved.pin,
                 effort,
                 entry.abort.signal,
               );

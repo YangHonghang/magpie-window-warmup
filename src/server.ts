@@ -14,6 +14,8 @@ import { acquireLock, openStore, StoreError, type Store } from "./store";
 
 /** 页面请求 /api/* 用的口令头 */
 export const TOKEN_HEADER = "x-window-warmup-token";
+/** 本插件服务的自标记响应头：所有响应都带，plugin.ts 靠它识别已有实例 */
+const MARKER_HEADER = "x-window-warmup";
 /** JSON 请求体上限：任务字段都很小，超限必然不是页面发的 */
 const BODY_LIMIT = 64 * 1024;
 
@@ -120,12 +122,16 @@ export async function startService(opts: ServiceOptions): Promise<ServiceHandle>
       hostname: "127.0.0.1",
       port: opts.port,
       async fetch(req: Request): Promise<Response> {
+        let res: Response;
         try {
-          return await handle(req);
+          res = await handle(req);
         } catch (e) {
           // 兜底错误也要带 CORS：否则沙箱页只看到 Failed to fetch，读不到原因
-          return json({ error: errText(e) }, 500, corsHeaders(req.headers.get("origin")));
+          res = json({ error: errText(e) }, 500, corsHeaders(req.headers.get("origin")));
         }
+        // 所有响应都带自标记：plugin.ts 启动前探测它，识别「本插件已在运行」
+        res.headers.set(MARKER_HEADER, "1");
+        return res;
       },
     });
   } catch (e) {

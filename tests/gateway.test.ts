@@ -1,4 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { accountsOf, pinFor } from "../src/accounts";
 import {
   createQuotaReader,
   fetchCatalog,
@@ -8,18 +13,22 @@ import {
   pickAutoModel,
   pickEffort,
   send,
+  WARMUP_MESSAGE,
 } from "../src/gateway";
-import type { EffortPick, RawModel, Task } from "../src/types";
+import type { CachedModel, KeyDirectoryEntry } from "../src/magpie-files";
+import type { CatalogAccount, EffortPick, QuotaEntry, QuotaWindow, RawModel, Task } from "../src/types";
 import { fakeGateway, type FakeGateway, type FakeGatewayOpts } from "./fake-gateway";
 
 const started: FakeGateway[] = [];
+const cleanupDirs: string[] = [];
 function start(opts: FakeGatewayOpts = {}): FakeGateway {
   const gw = fakeGateway(opts);
   started.push(gw);
   return gw;
 }
-afterEach(() => {
+afterEach(async () => {
   for (const gw of started.splice(0)) gw.stop();
+  while (cleanupDirs.length) await rm(cleanupDirs.pop()!, { recursive: true, force: true });
 });
 
 function mkTask(over: Partial<Task> = {}): Task {
@@ -166,9 +175,9 @@ describe("pickEffort", () => {
 });
 
 describe("send", () => {
-  test("请求体与会话头：max_tokens 16、stream false、无 reasoning_effort、无账号头", async () => {
+  test("请求体与会话头：max_tokens 16、stream false、消息恒为 hi、无 pin 则无账号头", async () => {
     const gw = start();
-    const r = await send(gw.base, mkTask(), null, new AbortController().signal);
+    const r = await send(gw.base, mkTask(), null, null, new AbortController().signal);
     expect(r.outcome).toBe("ok");
     expect(r.reason).toBe("");
     expect(typeof r.ms).toBe("number");
@@ -182,19 +191,46 @@ describe("send", () => {
     });
     expect(req.headers["x-magpie-session"]).toBe("window-warmup/t1");
     expect(req.headers["x-magpie-account"]).toBeUndefined();
+    expect(WARMUP_MESSAGE).toBe("hi");
   });
 
-  test("带 effort 与固定账号 → reasoning_effort 与 X-Magpie-Account", async () => {
+  test("带 effort 与 pin → reasoning_effort 与 X-Magpie-Account", async () => {
     const gw = start();
-    await send(gw.base, mkTask({ account: "acc-1" }), "low", new AbortController().signal);
+    await send(gw.base, mkTask(), "acc-1", "low", new AbortController().signal);
     const [req] = chatReqs(gw);
     expect(bodyOf(req).reasoning_effort).toBe("low");
     expect(req.headers["x-magpie-account"]).toBe("acc-1");
   });
 
+  test("中文 pin 按原始字节到线路上仍是 UTF-8（假网关读原始字节）", async () => {
+    // 真 socket 假网关：直接读请求字节，绕开 Headers 的解码差异
+    let got: string | null = null;
+    const server = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(socket, data) {
+          const head = data.toString("latin1");
+          const m = /^x-magpie-account:\s*(.*)\r?$/im.exec(head.slice(0, head.indexOf("\r\n\r\n")));
+          if (m && got === null) got = m[1];
+          socket.end();
+        },
+        error() {},
+      },
+    });
+    try {
+      await send(`http://127.0.0.1:${server.port}`, mkTask(), "免费flash", null, new AbortController().signal);
+      expect(got).not.toBeNull();
+      // 线路上的字节（latin1 逐字节还原）就是 UTF-8 的原文
+      expect(Buffer.from(got!, "latin1").toString("utf8")).toBe("免费flash");
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("429 + 上游 message → failed，原因含状态码与原文", async () => {
     const gw = start({ chat: { status: 429, body: { error: { message: "余额不足" } } } });
-    const r = await send(gw.base, mkTask(), null, new AbortController().signal);
+    const r = await send(gw.base, mkTask(), null, null, new AbortController().signal);
     expect(r.outcome).toBe("failed");
     expect(r.reason.includes("429")).toBe(true);
     expect(r.reason.includes("余额不足")).toBe(true);
@@ -202,42 +238,51 @@ describe("send", () => {
 
   test("固定账号 403 → 只请求一次，不改用其他账号", async () => {
     const gw = start({ chat: { status: 403, body: { error: { message: "该账号无权使用此模型" } } } });
-    const r = await send(gw.base, mkTask({ account: "acc-1" }), null, new AbortController().signal);
+    const r = await send(gw.base, mkTask(), "acc-1", null, new AbortController().signal);
     expect(r.outcome).toBe("failed");
     expect(chatReqs(gw)).toHaveLength(1);
   });
 
-  test("网关不可达 → failed 连不上 Magpie", async () => {
+  test("网关不可达 → failed，原因是底层原始错误（不再写死「连不上 Magpie」）", async () => {
     const gw = start();
     const base = gw.base;
     gw.stop();
-    const r = await send(base, mkTask(), null, new AbortController().signal);
+    // 同一地址直接 fetch 拿到的原始错误信息，就是 send 应上报的
+    let raw = "";
+    try {
+      await fetch(`${base}/v1/models`);
+    } catch (e) {
+      raw = e instanceof Error ? e.message : String(e);
+    }
+    expect(raw).not.toBe("");
+    const r = await send(base, mkTask(), null, null, new AbortController().signal);
     expect(r.outcome).toBe("failed");
-    expect(r.reason.startsWith("连不上 Magpie")).toBe(true);
+    expect(r.reason).toBe(raw);
+    expect(r.reason.includes("连不上 Magpie")).toBe(false);
   });
 
   test("超过注入的超时 → unknown，原因按实际超时时长生成（不硬写 30 秒）", async () => {
     const gw = start({ chat: { delayMs: 500 } });
-    const r = await send(gw.base, mkTask(), null, new AbortController().signal, 50);
+    const r = await send(gw.base, mkTask(), null, null, new AbortController().signal, 50);
     expect(r.outcome).toBe("unknown");
     expect(r.reason).toBe("50 毫秒内没有结果，可能已发送");
 
     const gw2 = start({ chat: { delayMs: 2500 } });
-    const r2 = await send(gw2.base, mkTask(), null, new AbortController().signal, 2000);
+    const r2 = await send(gw2.base, mkTask(), null, null, new AbortController().signal, 2000);
     expect(r2.outcome).toBe("unknown");
     expect(r2.reason).toBe("2 秒内没有结果，可能已发送");
   });
 
   test("HTTP 200 但响应体不完整 → unknown（不能判 ok）", async () => {
     const gw = start({ chat: { breakBody: "truncate" } });
-    const r = await send(gw.base, mkTask(), null, new AbortController().signal);
+    const r = await send(gw.base, mkTask(), null, null, new AbortController().signal);
     expect(r.outcome).toBe("unknown");
     expect(r.reason).toContain("响应");
   });
 
   test("响应中途连接重置 → unknown（可能已发送，不是连不上）", async () => {
     const gw = start({ chat: { breakBody: "reset" } });
-    const r = await send(gw.base, mkTask(), null, new AbortController().signal);
+    const r = await send(gw.base, mkTask(), null, null, new AbortController().signal);
     expect(r.outcome).toBe("unknown");
     expect(r.reason).toContain("可能已发送");
   });
@@ -246,7 +291,7 @@ describe("send", () => {
     const gw = start({ chat: { delayMs: 500 } });
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 30);
-    const r = await send(gw.base, mkTask(), null, ac.signal, 10_000);
+    const r = await send(gw.base, mkTask(), null, null, ac.signal, 10_000);
     expect(r.outcome).toBe("unknown");
     expect(r.reason).toBe("发送被取消");
   });
@@ -290,9 +335,17 @@ describe("fetchCatalog", () => {
     expect(openai.models.map((x) => x.id)).toEqual(["openai/gpt-5", "openai/gpt-5-mini"]);
     expect(okPick(openai.models[0].effort).send).toBe("low");
     expect(okPick(openai.models[1].effort).send).toBe("none");
+    // 订阅账号来自额度卡；没有模型缓存但 /v1/models 有模型 → 退化为全部模型、未按账号区分
     expect(openai.accounts).toEqual([
-      { id: "acct-1", label: "Yang", windows: [{ name: "5h", used: 2, resetsAt: FUTURE }] },
+      {
+        id: "acct-1", label: "acct-1", kind: "login",
+        windows: [{ name: "5h", used: 2, resetsAt: FUTURE }],
+        models: ["openai/gpt-5", "openai/gpt-5-mini"], perAccount: false,
+        autoModel: "openai/gpt-5-mini",
+      },
     ]);
+    expect(openai.autoAccountModels).toEqual(["openai/gpt-5", "openai/gpt-5-mini"]);
+    expect(openai.autoModel).toBe("openai/gpt-5-mini");
 
     const google = catalog.providers.find((p) => p.id === "google");
     if (!google) throw new Error("缺 google 供应商");
@@ -302,7 +355,7 @@ describe("fetchCatalog", () => {
     const moonshot = catalog.providers.find((p) => p.id === "moonshot");
     if (!moonshot) throw new Error("缺 moonshot 供应商");
     expect(moonshot.models).toEqual([]);
-    expect(moonshot.accounts[0].label).toBe("acct-9");
+    expect(moonshot.accounts[0].id).toBe("acct-9");
   });
 
   test("quotas 挂了 → 目录仍可用（账号为空）", async () => {
@@ -315,7 +368,7 @@ describe("fetchCatalog", () => {
     expect(catalog.providers[0].accounts).toEqual([]);
   });
 
-  test("key 限额卡账号归到供应商名下，与模型同一供应商", async () => {
+  test("key 限额卡只给 key 账号挂窗口用，自己不再是账号", async () => {
     const gw = start({
       models: [{ id: "office/gpt-5", owned_by: "office", reasoning: false }],
       quotas: [
@@ -325,35 +378,69 @@ describe("fetchCatalog", () => {
     });
     const catalog = await fetchCatalog(gw.base);
     expect(catalog.providers.map((p) => p.id)).toEqual(["office"]);
-    const office = catalog.providers[0];
-    expect(office.accounts.map((a) => a.id)).toEqual(["key-a", "key-b"]);
-    expect(office.accounts[0].label).toBe("Key A");
-    expect(office.accounts[1].label).toBe("key-b"); // 没有名字就用 key 名
+    // 临时 HOME 没有 providers.json：key 卡找不到对应的 key，不产生账号
+    expect(catalog.providers[0].accounts).toEqual([]);
   });
 
-  test("每个供应商给出 autoModel（服务端同一套规则算好）", async () => {
-    const gw = start({
-      models: [
-        { id: "openai/gpt-5.2", owned_by: "openai", reasoning: false },
-        { id: "openai/gpt-5.2-mini", owned_by: "openai", reasoning: false },
-        { id: "openai/gpt-5.2-turbo", owned_by: "openai", reasoning: false },
-        { id: "moonshot/kimi", owned_by: "moonshot", reasoning: false },
-      ],
-      quotas: [{ provider: "moonshot", user: "acct-9", name: "", windows: [] }],
-    });
-    const catalog = await fetchCatalog(gw.base);
-    const openai = catalog.providers.find((p) => p.id === "openai");
-    const moonshot = catalog.providers.find((p) => p.id === "moonshot");
-    if (!openai || !moonshot) throw new Error("缺供应商");
-    expect(openai.autoModel).toBe("openai/gpt-5.2-mini");
-    expect(moonshot.autoModel).toBe("moonshot/kimi");
+  test("有模型缓存 → autoAccountModels 与 autoModel 按缓存算；无缓存的退化用全部模型", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ww-catalog-"));
+    cleanupDirs.push(root);
+    await mkdir(join(root, "cfg", "magpie"), { recursive: true });
+    await mkdir(join(root, "cache", "magpie", "models"), { recursive: true });
+    await writeFile(
+      join(root, "cache", "magpie", "models", "openai.json"),
+      JSON.stringify({
+        fetched: "2026-11-01T00:00:00Z",
+        base: "https://x.test",
+        models: [{ ID: "gpt-5.2" }, { ID: "gpt-5.2-mini" }, { ID: "gpt-5.2-turbo" }],
+      }),
+    );
+    const savedConfig = process.env.XDG_CONFIG_HOME;
+    const savedCache = process.env.XDG_CACHE_HOME;
+    process.env.XDG_CONFIG_HOME = join(root, "cfg");
+    process.env.XDG_CACHE_HOME = join(root, "cache");
+    try {
+      const gw = start({
+        models: [
+          { id: "openai/gpt-5.2", owned_by: "openai", reasoning: false },
+          { id: "openai/gpt-5.2-mini", owned_by: "openai", reasoning: false },
+          { id: "openai/gpt-5.2-turbo", owned_by: "openai", reasoning: false },
+          { id: "moonshot/kimi", owned_by: "moonshot", reasoning: false },
+        ],
+        quotas: [{ provider: "moonshot", user: "acct-9", name: "", windows: [] }],
+      });
+      const catalog = await fetchCatalog(gw.base);
+      const openai = catalog.providers.find((p) => p.id === "openai");
+      const moonshot = catalog.providers.find((p) => p.id === "moonshot");
+      if (!openai || !moonshot) throw new Error("缺供应商");
+      expect(openai.autoAccountModels).toEqual([
+        "openai/gpt-5.2",
+        "openai/gpt-5.2-mini",
+        "openai/gpt-5.2-turbo",
+      ]);
+      expect(openai.autoModel).toBe("openai/gpt-5.2-mini");
+      // moonshot 没有缓存文件：退化为全部模型（/v1/models 里就是全部），autoModel 照常
+      expect(moonshot.autoAccountModels).toEqual(["moonshot/kimi"]);
+      expect(moonshot.autoModel).toBe("moonshot/kimi");
+    } finally {
+      if (savedConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = savedConfig;
+      if (savedCache === undefined) delete process.env.XDG_CACHE_HOME;
+      else process.env.XDG_CACHE_HOME = savedCache;
+    }
   });
 
-  test("网关不可达 → 抛「连不上 Magpie」", async () => {
+  test("网关不可达 → 抛底层原始错误", async () => {
     const gw = start();
     const base = gw.base;
     gw.stop();
-    await expect(fetchCatalog(base)).rejects.toThrow("连不上 Magpie");
+    let raw = "";
+    try {
+      await fetch(`${base}/v1/models`);
+    } catch (e) {
+      raw = e instanceof Error ? e.message : String(e);
+    }
+    await expect(fetchCatalog(base)).rejects.toThrow(raw);
   });
 });
 
@@ -377,11 +464,12 @@ describe("fetchQuotas", () => {
         account: "acct-1",
         label: "Yang",
         windows: [{ name: "5h", used: 2, resetsAt: FUTURE }],
+        viaKey: false,
       },
     ]);
   });
 
-  test("远程 key 限额卡（<p>/~keys）归并到供应商 <p>，账号 id 用 key 名", async () => {
+  test("远程 key 限额卡：viaKey 标记 + provider 归一成 <p>，user 原样保留", async () => {
     const gw = start({
       quotas: [
         {
@@ -400,9 +488,28 @@ describe("fetchQuotas", () => {
         account: "key-yang",
         label: "office @ yang",
         windows: [{ name: "5h", used: 1, resetsAt: FUTURE }],
+        viaKey: true,
       },
-      { provider: "openai", account: "acct-1", label: "Yang", windows: [] },
+      { provider: "openai", account: "acct-1", label: "Yang", windows: [], viaKey: false },
     ]);
+  });
+
+  test("unlimited: true 的「不限额」占位不是窗口，读取时剔除", async () => {
+    const gw = start({
+      quotas: [
+        {
+          provider: "openai",
+          user: "acct-1",
+          name: "Yang",
+          windows: [
+            { name: "5h", used: 2, resetsAt: FUTURE },
+            { name: "total", unlimited: true },
+          ],
+        },
+      ],
+    });
+    const snap = await fetchQuotas(gw.base);
+    expect(snap.entries[0].windows).toEqual([{ name: "5h", used: 2, resetsAt: FUTURE }]);
   });
 });
 
@@ -477,7 +584,7 @@ describe("额度兜底读取（kept 为空时读完整接口）", () => {
 
     const first = await read(gw.base);
     expect(first.entries).toEqual([
-      { provider: "openai", account: "acct-1", label: "A", windows: [] },
+      { provider: "openai", account: "acct-1", label: "A", windows: [], viaKey: false },
     ]);
     expect(fulls(gw)).toHaveLength(1);
 
@@ -542,5 +649,222 @@ describe("额度兜底读取（kept 为空时读完整接口）", () => {
     expect(a.entries).toEqual(b.entries);
     expect(b.entries).toEqual(c.entries);
     expect(a.entries).toHaveLength(1);
+  });
+});
+
+// ---------- 统一账号规则（src/accounts.ts，目录与调度器共用） ----------
+
+describe("accountsOf", () => {
+  const fp = (key: string): string =>
+    createHash("sha256").update(key, "utf8").digest("hex").slice(0, 10);
+  // 夹具假 key
+  const K_GLM = "sk-test-AAAA11";
+  const K_FREE = "sk-test-BBBB22";
+  const K_OTHER = "sk-test-CCCC33";
+  const FP = { glm: fp(K_GLM), free: fp(K_FREE), other: fp(K_OTHER) };
+  const P = "remote-magpie";
+  const M_FLASH = "remote-magpie/group/glm-5.3-flash";
+  const M_GLM = "remote-magpie/group/glm-5.3";
+  const M_QWEN = "remote-magpie/qwen-token-plan/qwen3.8-flash";
+
+  const keyDir = (): Map<string, KeyDirectoryEntry> =>
+    new Map([
+      [
+        P,
+        {
+          keys: [
+            { fingerprint: FP.free, name: "免费flash" },
+            { fingerprint: FP.glm, name: "GLM" },
+            { fingerprint: FP.other, name: "除GLM外其他" },
+          ],
+          accountModels: { [FP.glm]: ["group/glm-5.3"], yang: ["group/glm-5.3"] },
+        },
+      ],
+    ]);
+  const cache = (): CachedModel[] => [
+    { id: "group/glm-5.3-flash", keys: [FP.free, FP.glm] },
+    { id: "group/glm-5.3", keys: [FP.glm] },
+    { id: "qwen-token-plan/qwen3.8-flash", keys: [FP.other] },
+  ];
+  const models = (): string[] => [M_FLASH, M_GLM, M_QWEN];
+  const quotas = (): QuotaEntry[] => [
+    {
+      provider: P, account: "免费flash", label: "免费flash", viaKey: true,
+      windows: [{ name: "5h", used: 1, resetsAt: null }],
+    },
+    {
+      provider: P, account: "GLM", label: "GLM", viaKey: true,
+      windows: [
+        { name: "5h", used: 2, resetsAt: FUTURE },
+        // unlimited 是「不限额」占位，不是窗口：cast 塞进去验证账号侧同样剔除
+        { name: "week", used: 0, resetsAt: null, unlimited: true } as unknown as QuotaWindow,
+      ],
+    },
+    {
+      provider: P, account: "除GLM外其他 · sk-…ab", label: "除GLM外其他 · sk-…ab", viaKey: true,
+      windows: [{ name: "5h", used: 4, resetsAt: null }],
+    },
+    {
+      provider: P, account: "Yang", label: "Yang 主账号", viaKey: false,
+      windows: [{ name: "5h", used: 3, resetsAt: FUTURE }],
+    },
+  ];
+
+  const accountOf = (accounts: CatalogAccount[], id: string): CatalogAccount => {
+    const a = accounts.find((x) => x.id === id);
+    if (!a) throw new Error(`缺账号 ${id}`);
+    return a;
+  };
+
+  test("本机实况夹具：三个 key 账号各自的可选模型、窗口与自动模型", () => {
+    const { accounts, autoAccountModels } = accountsOf(P, {
+      models: models(), quotas: quotas(), keyDir: keyDir(), cache: cache(),
+    });
+    expect(accounts.map((a) => a.id).sort()).toEqual([FP.free, FP.glm, FP.other, "Yang"].sort());
+
+    const free = accountOf(accounts, FP.free);
+    expect(free).toEqual({
+      id: FP.free, label: "免费flash", kind: "key",
+      windows: [{ name: "5h", used: 1, resetsAt: null }],
+      models: [M_FLASH], perAccount: true, autoModel: M_FLASH,
+    });
+    // GLM：accountModels 限定 glm-5.3；~keys 卡的 unlimited 窗口被剔除
+    expect(accountOf(accounts, FP.glm)).toEqual({
+      id: FP.glm, label: "GLM", kind: "key",
+      windows: [{ name: "5h", used: 2, resetsAt: FUTURE }],
+      models: [M_GLM], perAccount: true, autoModel: M_GLM,
+    });
+    // 除GLM外其他：卡名是「名字 · 打码」形态，仍按前缀挂上
+    expect(accountOf(accounts, FP.other)).toEqual({
+      id: FP.other, label: "除GLM外其他", kind: "key",
+      windows: [{ name: "5h", used: 4, resetsAt: null }],
+      models: [M_QWEN], perAccount: true, autoModel: M_QWEN,
+    });
+    // 订阅账号：accountModels 按小写名过滤（键 yang，账号 Yang）
+    expect(accountOf(accounts, "Yang")).toEqual({
+      id: "Yang", label: "Yang", kind: "login",
+      windows: [{ name: "5h", used: 3, resetsAt: FUTURE }],
+      models: [M_GLM], perAccount: true, autoModel: M_GLM,
+    });
+    expect(autoAccountModels).toEqual([M_FLASH, M_GLM, M_QWEN].sort());
+  });
+
+  test("没有额度卡对应的 key 不产生账号；key 卡本身不变成登录账号", () => {
+    const { accounts } = accountsOf(P, {
+      models: models(),
+      quotas: [
+        { provider: P, account: "ghost-key", label: "ghost", viaKey: true, windows: [] },
+        { provider: P, account: "ghost-acct", label: "ghost", viaKey: false, windows: [] },
+      ],
+      keyDir: keyDir(),
+      cache: cache(),
+    });
+    expect(accounts.map((a) => a.id).sort()).toEqual([FP.free, FP.glm, FP.other, "ghost-acct"].sort());
+  });
+
+  test("缓存缺失退化：/v1/models 有模型 → 全部模型不按账号区分（第 1 层跳过），perAccount false", () => {
+    const { accounts, autoAccountModels } = accountsOf(P, {
+      models: models(), quotas: quotas(), keyDir: keyDir(), cache: null,
+    });
+    for (const id of [FP.free, FP.glm, FP.other, "Yang"]) {
+      const a = accountOf(accounts, id);
+      // 第 2 层（accountModels）仍然生效：GLM 与 Yang 仍被限定
+      if (id === FP.glm || id === "Yang") {
+        expect(a.models).toEqual([M_GLM]);
+      } else {
+        expect(a.models).toEqual([M_FLASH, M_GLM, M_QWEN].sort());
+      }
+      expect(a.perAccount).toBe(false);
+      expect(a.autoModel).toBe(a.models!.length === 1 ? M_GLM : "remote-magpie/group/glm-5.3-flash");
+    }
+    expect(autoAccountModels).toEqual([M_FLASH, M_GLM, M_QWEN].sort());
+  });
+
+  test("缓存与 /v1/models 模型都没有 → models null（提示 B、自动模型失败）", () => {
+    const { accounts, autoAccountModels } = accountsOf(P, {
+      models: [], quotas: quotas(), keyDir: keyDir(), cache: null,
+    });
+    for (const a of accounts) {
+      expect(a.models).toBeNull();
+      expect(a.perAccount).toBe(false);
+      expect(a.autoModel).toBeNull();
+    }
+    expect(autoAccountModels).toBeNull();
+  });
+
+  test("窗口匹配：未命名 key 接受无窗口；同名两把 key 都挂「名字 · 打码」卡", () => {
+    const fpA = fp("sk-test-AAAA11");
+    const fpB = fp("sk-test-BBBB22");
+    const fpC = fp("sk-test-CCCC33");
+    const win = [{ name: "5h", used: 7, resetsAt: null }];
+    const { accounts } = accountsOf(P, {
+      models: models(),
+      quotas: [
+        { provider: P, account: "GLM · sk-…9f", label: "GLM · sk-…9f", viaKey: true, windows: win },
+        { provider: P, account: "sk-…cd", label: "sk-…cd", viaKey: true, windows: win },
+      ],
+      keyDir: new Map([
+        [P, {
+          keys: [
+            { fingerprint: fpA, name: "" },
+            { fingerprint: fpB, name: "GLM" },
+            { fingerprint: fpC, name: "GLM" },
+          ],
+          accountModels: {},
+        }],
+      ]),
+      cache: cache(),
+    });
+    // 没起名：卡名是打码后的样子，插件算不出来 → 无窗口
+    expect(accountOf(accounts, fpA).windows).toEqual([]);
+    // 同名两把：都挂到「GLM · 打码」那张卡
+    expect(accountOf(accounts, fpB).windows).toEqual(win);
+    expect(accountOf(accounts, fpC).windows).toEqual(win);
+  });
+});
+
+describe("pinFor", () => {
+  const fp = (key: string): string =>
+    createHash("sha256").update(key, "utf8").digest("hex").slice(0, 10);
+  const P = "remote-magpie";
+  const keyDir = (names: string[]): Map<string, KeyDirectoryEntry> =>
+    new Map([
+      [P, {
+        keys: names.map((name, i) => ({ fingerprint: fp(`sk-test-${i}-key`), name })),
+        accountModels: {},
+      }],
+    ]);
+
+  test("空账号 → null", () => {
+    expect(pinFor(P, "", keyDir(["a", "b"]), [])).toBeNull();
+  });
+
+  test("启用 key ≥2 把 → P#指纹；只有 1 把 → null（候选 ID 就是供应商 id）", () => {
+    const fp0 = fp("sk-test-0-key");
+    expect(pinFor(P, fp0, keyDir(["a", "b"]), [])).toBe(`${P}#${fp0}`);
+    expect(pinFor(P, fp0, keyDir(["a"]), [])).toBeNull();
+  });
+
+  test("订阅账号名原样；形如 10 位 hex 的订阅名也在账号列表里 → 仍原样", () => {
+    const quotas: QuotaEntry[] = [
+      { provider: P, account: "Yang", label: "Y", viaKey: false, windows: [] },
+      { provider: P, account: "abc1234567", label: "h", viaKey: false, windows: [] },
+    ];
+    expect(pinFor(P, "Yang", keyDir(["a", "b"]), quotas)).toBe("Yang");
+    expect(pinFor(P, "abc1234567", keyDir(["a", "b"]), quotas)).toBe("abc1234567");
+  });
+
+  test("目录读不出且账号是 10 位小写 hex → 按 ≥2 处理，发 P#账号", () => {
+    expect(pinFor(P, "abc1234567", null, [])).toBe(`${P}#abc1234567`);
+    expect(pinFor(P, "ABC1234567", null, [])).toBe("ABC1234567"); // 大写不是指纹形态，原样
+  });
+
+  test("供应商在目录里但认不出这把 key：按该供应商的启用 key 数走指纹规则", () => {
+    expect(pinFor(P, "abc1234567", keyDir(["a", "b"]), [])).toBe(`${P}#abc1234567`);
+    expect(pinFor(P, "abc1234567", keyDir(["a"]), [])).toBeNull();
+  });
+
+  test("旧任务里存的 key 名 → 原样发头", () => {
+    expect(pinFor(P, "免费flash", keyDir(["免费flash"]), [])).toBe("免费flash");
   });
 });

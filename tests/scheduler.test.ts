@@ -1,12 +1,18 @@
 // 调度器的失败测试：注入假时钟、假定时器与假网关函数，不发任何真实请求。
 // 单个定时器有 10 分钟封顶，跨长时段的断言一律看 snapshot().next（语义到期点）而非定时器 at。
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { CachedModel, KeyDirectoryEntry } from "../src/magpie-files";
 import { openStore, type Store, type TaskMarks } from "../src/store";
 import { Scheduler, type TaskInput } from "../src/scheduler";
 import type { QuotaEntry, RawModel, Run, SendResult, Task } from "../src/types";
+
+// 测试进程绝不读真实用户的 Magpie 配置：把默认目录推导用的 XDG 钉到临时位置
+process.env.XDG_CONFIG_HOME = join(tmpdir(), "window-warmup-test-magpie-config");
+process.env.XDG_CACHE_HOME = join(tmpdir(), "window-warmup-test-magpie-cache");
 
 const HOUR = 3_600_000;
 const T0 = "2026-10-31T05:00:00+08:00"; // 周六 05:00，上海
@@ -25,7 +31,9 @@ function dailyTask(over: Partial<TaskInput> = {}): TaskInput {
 }
 
 interface SendCall {
-  task: Pick<Task, "id" | "account" | "model" | "message">;
+  task: Pick<Task, "id" | "model">;
+  /** 调度器按统一账号规则算好的账号头值；null = 不带头 */
+  pin: string | null;
   effort: string | null;
   signal: AbortSignal;
 }
@@ -42,6 +50,12 @@ interface HarnessOpts {
   startISO?: string;
   /** 包装 store，模拟落盘失败 */
   storeWrap?: (s: Store) => Store;
+  /** providers.json 目录的替身（指纹与 accountModels）；不传 = 读不出 */
+  keyDir?: Map<string, KeyDirectoryEntry>;
+  /** 直接注入 keyDirFn（延迟 resolve 等竞态测试用）；优先于 keyDir */
+  keyDirFn?: () => Promise<Map<string, KeyDirectoryEntry> | null>;
+  /** 供应商 → 模型缓存替身；不传 = 没有缓存 */
+  modelCache?: (providerId: string) => CachedModel[] | null;
 }
 
 interface Harness {
@@ -88,11 +102,12 @@ async function harness(opts: HarnessOpts = {}): Promise<Harness> {
   const sendCalls: SendCall[] = [];
   const sendFn = async (
     _base: string,
-    task: Pick<Task, "id" | "account" | "model" | "message">,
+    task: Pick<Task, "id" | "model">,
+    pin: string | null,
     effort: string | null,
     signal: AbortSignal,
   ): Promise<SendResult> => {
-    const call: SendCall = { task, effort, signal };
+    const call: SendCall = { task, pin, effort, signal };
     sendCalls.push(call);
     return opts.sendImpl ? opts.sendImpl(call) : { outcome: "ok", reason: "", ms: 2 };
   };
@@ -116,6 +131,9 @@ async function harness(opts: HarnessOpts = {}): Promise<Harness> {
     sendFn,
     modelsFn: async () => models,
     ...(quotasFn ? { quotasFn } : {}),
+    // key 目录与模型缓存一律注入替身，测试进程不碰真实文件
+    keyDirFn: opts.keyDirFn ?? (async () => opts.keyDir ?? null),
+    modelCacheFn: async (pid) => opts.modelCache?.(pid) ?? null,
   });
   return {
     scheduler, store, sendCalls, models,
@@ -255,7 +273,7 @@ test("window：同一 resetKey 只发一次；空闲窗口同一小时不重试�
   const h = await harness({
     quotas: () => ({
       entries: [{
-        provider: "openai", account: "acct-yang", label: "Y",
+        provider: "openai", account: "acct-yang", label: "Y", viaKey: false,
         windows: [{ name: "5h", used: 0, resetsAt: null }], // 空闲窗口：立即到期
       }],
     }),
@@ -290,7 +308,7 @@ test("window：找不到窗口记一次失败，重复刷新不重复记录", as
   const h = await harness({
     quotas: () => ({
       entries: [{
-        provider: "openai", account: "acct-yang", label: "Y",
+        provider: "openai", account: "acct-yang", label: "Y", viaKey: false,
         windows: [{ name: "week", used: 1, resetsAt: null }], // 没有 5h 窗口
       }],
     }),
@@ -319,7 +337,7 @@ test("window：resetsAt 在未来 → 到期点为 resetsAt+30s，按 resetsAt �
   const h = await harness({
     quotas: () => ({
       entries: [{
-        provider: "openai", account: "acct-yang", label: "Y",
+        provider: "openai", account: "acct-yang", label: "Y", viaKey: false,
         windows: [{ name: "5h", used: 3, resetsAt: resetAt.toISOString() }],
       }],
     }),
@@ -339,7 +357,7 @@ test("window：resetsAt 在未来 → 到期点为 resetsAt+30s，按 resetsAt �
   expect(h.sendCalls).toHaveLength(1);
   expect(h.store.data.runs[0].resetKey).toBe(resetAt.toISOString());
   expect(h.store.data.runs[0].due).toBe(new Date(resetAt.getTime() + 30_000).toISOString());
-  expect(h.sendCalls[0].task.account).toBe("acct-yang");
+  expect(h.sendCalls[0].pin).toBe("acct-yang"); // 订阅账号名原样作头值
 });
 
 test("发送进行中再次到期 → 记一次「上一次发送还没结束，本次跳过」；runNow 冲突", async () => {
@@ -503,7 +521,7 @@ test("model 为空 → 每次发送前现选供应商模型，发送与 run.mode
   expect(onDisk.tasks[0].model).toBe("");
 });
 
-test("model 为空且该供应商没有模型 → failed「供应商 X 下没有可用模型」，不调用 send", async () => {
+test("model 为空且既无缓存也无模型 → failed「供应商 X 还没有模型列表」，不调用 send", async () => {
   const h = await harness({ models: [{ id: "p2/m", owned_by: "p2", reasoning: false }] });
   const id = (await h.scheduler.upsert(dailyTask({ provider: "p1", model: "" }))).id;
   await firedDaily(h);
@@ -511,7 +529,7 @@ test("model 为空且该供应商没有模型 → failed「供应商 X 下没有
   expect(h.sendCalls).toHaveLength(0);
   const run = h.store.data.runs.find((r) => r.taskId === id)!;
   expect(run.outcome).toBe("failed");
-  expect(run.reason).toBe("供应商 p1 下没有可用模型");
+  expect(run.reason).toBe("供应商 p1 还没有模型列表，无法自动选模型");
   expect(run.model).toBeNull();
 });
 
@@ -585,7 +603,7 @@ test("window：同一份旧 resetsAt 刷新/跨小时/重启均不重发，新 r
   let resetsAt = new Date(ms(T0) + 2 * HOUR);
   const quotas = () => ({
     entries: [{
-      provider: "openai", account: "acct-yang", label: "Y",
+      provider: "openai", account: "acct-yang", label: "Y", viaKey: false,
       windows: [{ name: "5h", used: 3, resetsAt: resetsAt.toISOString() }],
     }],
   });
@@ -644,7 +662,7 @@ test("window：同一份旧 resetsAt 刷新/跨小时/重启均不重发，新 r
 test("window：实际重置发送后，同小时内缓存丢掉 resetsAt 不再按 idle key 二次发送", async () => {
   const resetAt = new Date(ms(T0) + 2 * HOUR); // 07:00+08:00
   let entries: QuotaEntry[] = [{
-    provider: "openai", account: "acct-yang", label: "Y",
+    provider: "openai", account: "acct-yang", label: "Y", viaKey: false,
     windows: [{ name: "5h", used: 3, resetsAt: resetAt.toISOString() }],
   }];
   const h = await harness({ quotas: () => ({ entries }) });
@@ -662,7 +680,7 @@ test("window：实际重置发送后，同小时内缓存丢掉 resetsAt 不再�
 
   // 额度缓存把 resetsAt 丢成 null（同一实际重置周期内）
   entries = [{
-    provider: "openai", account: "acct-yang", label: "Y",
+    provider: "openai", account: "acct-yang", label: "Y", viaKey: false,
     windows: [{ name: "5h", used: 0, resetsAt: null }],
   }];
   h.advance(10 * 60_000); // 07:10:30 刷新拿到新快照
@@ -684,7 +702,7 @@ test("window：不可解析的 resetsAt 按空闲每小时限频，key 不用原
   const h = await harness({
     quotas: () => ({
       entries: [{
-        provider: "openai", account: "acct-yang", label: "Y",
+        provider: "openai", account: "acct-yang", label: "Y", viaKey: false,
         windows: [{ name: "5h", used: 0, resetsAt: "not-a-date" }],
       }],
     }),
@@ -755,4 +773,131 @@ test("坏时区任务不拖垮 snapshot：该任务 next 置空、不进时间�
   expect(view.timeline.some((p) => p.taskId === "t-bad")).toBe(false);
   expect(view.next[good]).toBe(new Date(ms("2026-10-31T06:00:00+08:00")).toISOString());
   expect(view.timeline.some((p) => p.taskId === good)).toBe(true);
+});
+
+// ---------- 统一账号规则接入调度器（key 目录与模型缓存注入替身） ----------
+
+const fingerprint = (key: string): string =>
+  createHash("sha256").update(key, "utf8").digest("hex").slice(0, 10);
+
+test("自动模型按账号列表选：key 账号按缓存 Keys 与 accountModels 过滤，并带上 P#指纹 头", async () => {
+  const fp1 = fingerprint("sk-test-AAAA11");
+  const fp2 = fingerprint("sk-test-BBBB22");
+  const h = await harness({
+    models: [
+      { id: "p1/m-one", owned_by: "p1", reasoning: false },
+      { id: "p1/m-two", owned_by: "p1", reasoning: false },
+    ],
+    keyDir: new Map([
+      [
+        "p1",
+        {
+          keys: [{ fingerprint: fp1, name: "GLM" }, { fingerprint: fp2, name: "免费flash" }],
+          accountModels: { [fp1]: ["m-one"] },
+        },
+      ],
+    ]),
+    modelCache: () => [{ id: "m-one", keys: [fp1] }, { id: "m-two", keys: [fp2] }],
+  });
+  await h.scheduler.upsert(dailyTask({ provider: "p1", model: "", account: fp1 }));
+  await firedDaily(h);
+  // m-two 的 Keys 不含 fp1 → 第 1 层剔除；accountModels 限定 m-one
+  expect(h.sendCalls[0].task.model).toBe("p1/m-one");
+  expect(h.sendCalls[0].pin).toBe(`p1#${fp1}`); // 启用 key ≥2 把 → <P>#指纹
+  expect(h.sendCalls[0].effort).toBeNull();
+  expect(h.store.data.runs[0].model).toBe("p1/m-one");
+});
+
+test("只有一把 key 时指纹账号不发账号头；旧任务里存的 key 名原样发", async () => {
+  const fp1 = fingerprint("sk-test-AAAA11");
+  const h = await harness({
+    models: [{ id: "p1/m-one", owned_by: "p1", reasoning: false }],
+    keyDir: new Map([["p1", { keys: [{ fingerprint: fp1, name: "GLM" }], accountModels: {} }]]),
+    modelCache: () => [{ id: "m-one", keys: [] }],
+  });
+  await h.scheduler.upsert(dailyTask({ provider: "p1", model: "", account: fp1 }));
+  await firedDaily(h);
+  expect(h.sendCalls[0].pin).toBeNull(); // 单把 key：候选 ID 就是供应商 id，不带头
+
+  const h2 = await harness({
+    models: [{ id: "p1/m-one", owned_by: "p1", reasoning: false }],
+    keyDir: new Map([["p1", { keys: [{ fingerprint: fp1, name: "免费flash" }], accountModels: {} }]]),
+    modelCache: () => [{ id: "m-one", keys: [] }],
+  });
+  await h2.scheduler.upsert(dailyTask({ provider: "p1", model: "", account: "免费flash" }));
+  await firedDaily(h2);
+  expect(h2.sendCalls[0].pin).toBe("免费flash"); // 旧数据兼容：key 名原样作头值
+});
+
+test("空账号自动选模型：不带头，用「自动选账号」的模型列表（不受单把 key 的 Keys 限制）", async () => {
+  const h = await harness({
+    models: [
+      { id: "p1/m-one", owned_by: "p1", reasoning: false },
+      { id: "p1/m-one-flash", owned_by: "p1", reasoning: false },
+    ],
+    keyDir: new Map([
+      ["p1", { keys: [{ fingerprint: fingerprint("sk-test-AAAA11"), name: "GLM" }], accountModels: {} }],
+    ]),
+    modelCache: () => [{ id: "m-one", keys: [fingerprint("sk-test-AAAA11")] }, { id: "m-one-flash", keys: [] }],
+  });
+  await h.scheduler.upsert(dailyTask({ provider: "p1", model: "" }));
+  await firedDaily(h);
+  expect(h.sendCalls[0].pin).toBeNull();
+  expect(h.sendCalls[0].task.model).toBe("p1/m-one-flash");
+});
+
+test("窗口任务用统一账号列表找窗口：key 账号按指纹反查 key 名再匹配 ~keys 卡", async () => {
+  const fp1 = fingerprint("sk-test-AAAA11");
+  const entries: QuotaEntry[] = [
+    {
+      provider: "p1", account: "GLM", label: "GLM", viaKey: true,
+      windows: [{ name: "5h", used: 0, resetsAt: null }], // 空闲窗口：立即到期
+    },
+  ];
+  const h = await harness({
+    quotas: () => ({ entries }),
+    keyDir: new Map([["p1", { keys: [{ fingerprint: fp1, name: "GLM" }], accountModels: {} }]]),
+    modelCache: () => [{ id: "m-one", keys: [] }],
+    models: [{ id: "p1/m-one", owned_by: "p1", reasoning: false }],
+  });
+  await h.scheduler.upsert(
+    dailyTask({ provider: "p1", model: "", account: fp1, trigger: { kind: "window", window: "5h" } }),
+  );
+  h.scheduler.start();
+  h.fireDue();
+  await h.flush();
+  expect(h.sendCalls).toHaveLength(1);
+  expect(h.sendCalls[0].pin).toBeNull(); // 目录里只有 1 把 key：指纹账号不发头
+});
+
+test("key 目录比额度快照后到 → 首轮不误报「额度里没有账号」，到齐后照常发送（竞态回归）", async () => {
+  const fp1 = fingerprint("sk-test-AAAA11");
+  const entries: QuotaEntry[] = [
+    {
+      provider: "p1", account: "GLM", label: "GLM", viaKey: true,
+      windows: [{ name: "5h", used: 0, resetsAt: null }], // 空闲窗口：立即到期
+    },
+  ];
+  const keyDir = new Map([
+    ["p1", { keys: [{ fingerprint: fp1, name: "GLM" }], accountModels: {} }],
+  ]);
+  const h = await harness({
+    quotas: () => ({ entries }),
+    models: [{ id: "p1/m-one", owned_by: "p1", reasoning: false }],
+    modelCache: () => [{ id: "m-one", keys: [] }],
+    // key 目录读取（真实文件 I/O 的形态）慢于额度快照返回
+    keyDirFn: () => new Promise((resolve) => setTimeout(() => resolve(keyDir), 20)),
+  });
+  await h.scheduler.upsert(
+    dailyTask({ provider: "p1", model: "", account: fp1, trigger: { kind: "window", window: "5h" } }),
+  );
+  h.scheduler.start();
+  h.fireDue(); // 首轮 tick：额度先落，key 目录 20ms 后到
+  await h.flush();
+
+  // 修复前：keyDirMap 还是 null → 指纹解析不出 key 名 → 记「额度里没有账号 <指纹>」且不发送
+  const failed = h.store.data.runs.filter((r) => r.outcome === "failed");
+  expect(failed.some((r) => r.reason.includes("额度里没有账号"))).toBe(false);
+  expect(h.sendCalls).toHaveLength(1);
+  expect(h.sendCalls[0].pin).toBeNull(); // 目录里只有 1 把 key：不发头
 });

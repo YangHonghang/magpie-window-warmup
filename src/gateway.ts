@@ -2,6 +2,8 @@
 // 一切请求只打本地网关（base 由 gatewayBase 从 MAGPIE_ADDR 推出），超时都偏短：
 // 网关不可达时调度层要把失败写进执行记录，而不是被挂住的请求拖死。
 
+import { accountsOf, pickAutoModel } from "./accounts";
+import { magpieDirs, readKeyDirectory, readModelCache, type CachedModel } from "./magpie-files";
 import type {
   Catalog,
   CatalogProvider,
@@ -12,6 +14,9 @@ import type {
   SendResult,
   Task,
 } from "./types";
+
+// 自动选模型的规则在 accounts.ts（与账号规则同源）；这里转出保持既有公开 API 不变
+export { pickAutoModel };
 
 /** MAGPIE_ADDR 缺省时的老端口 */
 const DEFAULT_GATEWAY = "http://127.0.0.1:3425";
@@ -132,20 +137,22 @@ function errorReason(text: string): string {
   return text.trim().slice(0, REASON_MAX) || "上游未返回错误说明";
 }
 
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 async function requestJSON(
   base: string,
   path: string,
   signal?: AbortSignal,
   timeoutMs: number = READ_TIMEOUT_MS,
 ): Promise<unknown> {
-  // 外部 signal（发送被停用/删除）与读超时一并生效，取元数据阶段也能被立即中止
+  // 外部 signal（发送被停用/删除）与读超时一并生效，取元数据阶段也能被立即中止。
+  // 连接失败不包装：底层原始错误如实抛给上层显示
   const timeout = AbortSignal.timeout(timeoutMs);
-  let res: Response;
-  try {
-    res = await fetch(base + path, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
-  } catch {
-    throw new Error(`连不上 Magpie（${base}）`);
-  }
+  const res = await fetch(base + path, {
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
   const text = await res.text().catch(() => "");
   if (!res.ok) throw new Error(`HTTP ${res.status}：${errorReason(text)}`);
   try {
@@ -164,39 +171,43 @@ function dataArray(data: unknown): unknown[] {
   return [];
 }
 
-function coerceWindow(w: unknown): QuotaWindow {
-  const raw = typeof w === "object" && w !== null ? (w as Record<string, unknown>) : {};
-  return {
-    name: typeof raw.name === "string" ? raw.name : "",
-    used: typeof raw.used === "number" ? raw.used : null,
-    resetsAt: typeof raw.resetsAt === "string" ? raw.resetsAt : null,
-  };
+function coerceWindows(list: unknown): QuotaWindow[] {
+  const out: QuotaWindow[] = [];
+  for (const w of Array.isArray(list) ? list : []) {
+    const raw = typeof w === "object" && w !== null ? (w as Record<string, unknown>) : {};
+    // unlimited: true 是「不限额」占位，不是窗口（magpie 额度卡用来补齐总余额），剔除
+    if (raw.unlimited === true) continue;
+    out.push({
+      name: typeof raw.name === "string" ? raw.name : "",
+      used: typeof raw.used === "number" ? raw.used : null,
+      resetsAt: typeof raw.resetsAt === "string" ? raw.resetsAt : null,
+    });
+  }
+  return out;
 }
 
 /**
  * 远程 magpie 给每把网关 key 单独发一张限额卡，provider 记作 "<p>/~keys"、user 是 key 名
- * （magpie internal/provider/remote_key_limits.go 的 remoteKeyCard）。而 /v1/models 的
- * owned_by 是 "<p>" 本身——不归并的话这些 key 账号永远挂不上供应商，任务没法选它们。
- * 这里把卡归回供应商 <p>，账号 id 沿用 key 名。供应商 id 不含 "~"（同上出处），后缀不会撞车。
+ * 或打码形态（magpie internal/provider/remote_key_limits.go 的 remoteKeyCard）。条目保留
+ * 这层来历：viaKey 标记 + provider 归一成 <p>——key 卡只能挂到 providers.json 里对应的那把
+ * key 上（账号统一规则在 accounts.ts），不能再像 0.1 那样直接变成供应商账号。
  */
-function quotaProvider(raw: string): string {
-  return raw.endsWith("/~keys") ? raw.slice(0, -"/~keys".length) : raw;
-}
-
-/** 把 /v1/magpie/quotas 的响应体归一成条目列表；没有归属的条目挂不到任务上，跳过 */
 function parseQuotas(data: unknown): QuotaEntry[] {
   const entries: QuotaEntry[] = [];
   for (const item of dataArray(data)) {
     if (typeof item !== "object" || item === null) continue;
     const q = item as Record<string, unknown>;
-    const provider = quotaProvider(typeof q.provider === "string" ? q.provider : "");
+    const rawProvider = typeof q.provider === "string" ? q.provider : "";
+    const viaKey = rawProvider.endsWith("/~keys");
+    const provider = viaKey ? rawProvider.slice(0, -"/~keys".length) : rawProvider;
     const user = typeof q.user === "string" ? q.user : "";
     if (!provider || !user) continue;
     entries.push({
       provider,
       account: user,
       label: typeof q.name === "string" && q.name ? q.name : user,
-      windows: (Array.isArray(q.windows) ? q.windows : []).map(coerceWindow),
+      windows: coerceWindows(q.windows),
+      viaKey,
     });
   }
   return entries;
@@ -276,65 +287,11 @@ export function modelProvider(m: RawModel): string {
 }
 
 /**
- * 自动选模型的规格词与优先序：越小越省额度（flash 最小），模型都不含的排最后。
- * 与 pickEffort 一样每次发送前现算，不落进任务。
- */
-const AUTO_SPEC_WORDS = ["flash", "lite", "mini", "nano", "small", "turbo"] as const;
-const AUTO_SPEC_RES = AUTO_SPEC_WORDS.map((w) => new RegExp(`\\b${w}\\b`, "i"));
-
-/** id 最后一段命中了哪个规格档；单词匹配，"minimax" 不算 mini；都没命中返回词表长度 */
-function specTier(id: string): number {
-  const seg = id.slice(id.lastIndexOf("/") + 1);
-  let best: number = AUTO_SPEC_WORDS.length;
-  for (let i = 0; i < AUTO_SPEC_RES.length; i++) {
-    if (i < best && AUTO_SPEC_RES[i].test(seg)) best = i;
-  }
-  return best;
-}
-
-/**
- * id 的数字感知比较（降序，新版本在前）：数字段按数值（10 > 9）、文本段按字典序，
- * 一方是另一方的前缀时更长（更具体/更新）的在前。
- */
-function cmpNewerDesc(a: string, b: string): number {
-  const ta = a.toLowerCase().match(/\d+|\D+/g) ?? [];
-  const tb = b.toLowerCase().match(/\d+|\D+/g) ?? [];
-  for (let i = 0; i < Math.max(ta.length, tb.length); i++) {
-    const x = ta[i];
-    const y = tb[i];
-    if (x === undefined) return 1;
-    if (y === undefined) return -1;
-    const nx = /^\d+$/.test(x);
-    const ny = /^\d+$/.test(y);
-    if (nx && ny) {
-      // 数字相等（如 "5" 与 "5.2" 的前段）不算分出胜负，继续比后面的 token
-      const d = Number(y) - Number(x);
-      if (d !== 0) return d;
-    } else if (nx !== ny) {
-      return nx ? -1 : 1;
-    } else if (x !== y) {
-      return y < x ? 1 : -1;
-    }
-  }
-  return 0;
-}
-
-/**
- * 自动选模型：在（调用方已按供应商筛好的）候选里，按 id 最后一段的规格词
- * flash < lite < mini < nano < small < turbo 排序取第一个，都没有的排最后；
- * 同档按 id 数字感知降序（新版本优先）。选不到（空列表）返回 null。
- */
-export function pickAutoModel(models: RawModel[]): RawModel | null {
-  if (models.length === 0) return null;
-  const decorated = models.map((m, i) => ({ m, tier: specTier(m.id), i }));
-  decorated.sort((a, b) => a.tier - b.tier || cmpNewerDesc(a.m.id, b.m.id) || a.i - b.i);
-  return decorated[0].m;
-}
-
-/**
- * 模型目录：按 owned_by（真正接住请求的一方）或 id 前缀归供应商，路由组 group/ 一律不列出。
- * 账号与窗口来自 quotas（key 限额卡已归并回供应商）；额度接口挂了不连累模型目录
- * （照搬 fingerprint 的取舍）。autoModel 用与调度器同一套规则在服务端算好，页面直接显示。
+ * 模型目录：模型按 owned_by（真正接住请求的一方）或 id 前缀归供应商，路由组 group/ 一律不列出。
+ * 账号、窗口与每账号可选模型走统一账号规则（accounts.ts）：key 账号来自 providers.json 的
+ * 指纹，订阅账号来自额度卡，key 卡只用来给 key 账号挂窗口。providers.json 读不出 → key
+ * 账号为空，目录照常返回；额度接口挂了不连累模型目录（照搬 fingerprint 的取舍）。
+ * autoModel 用与调度器同一套规则在服务端算好，页面直接显示。
  */
 export async function fetchCatalog(base: string): Promise<Catalog> {
   const [modelsData, quotas] = await Promise.all([
@@ -346,7 +303,7 @@ export async function fetchCatalog(base: string): Promise<Catalog> {
   const ensure = (id: string): CatalogProvider => {
     let p = providers.get(id);
     if (!p) {
-      p = { id, accounts: [], models: [], autoModel: null };
+      p = { id, accounts: [], models: [], autoAccountModels: null, autoModel: null };
       providers.set(id, p);
     }
     return p;
@@ -363,21 +320,36 @@ export async function fetchCatalog(base: string): Promise<Catalog> {
     if (raws) raws.push(m);
     else rawModels.set(pid, [m]);
   }
-  const seenAccounts = new Set<string>();
-  for (const q of quotas.entries) {
-    const key = `${q.provider}/${q.account}`;
-    if (seenAccounts.has(key)) continue;
-    seenAccounts.add(key);
-    ensure(q.provider).accounts.push({ id: q.account, label: q.label, windows: q.windows });
-  }
+  for (const q of quotas.entries) ensure(q.provider);
+  // providers.json 与各供应商的模型缓存逐个现读；读不出按「没有」处理，不让整个目录 502
+  const dirs = magpieDirs();
+  const keyDir = await readKeyDirectory(dirs.config).catch(() => null);
+  const caches = new Map<string, CachedModel[] | null>();
+  const cacheOf = async (pid: string): Promise<CachedModel[] | null> => {
+    let c = caches.get(pid);
+    if (c === undefined) {
+      c = await readModelCache(dirs.cache, pid);
+      caches.set(pid, c);
+    }
+    return c;
+  };
   const list = [...providers.values()];
   for (const p of list) {
     const raws = rawModels.get(p.id) ?? [];
     p.models = raws
       .map((m) => ({ id: m.id, effort: pickEffort(m) }))
       .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-    p.autoModel = pickAutoModel(raws)?.id ?? null;
-    p.accounts.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const built = accountsOf(p.id, {
+      models: raws.map((m) => m.id),
+      quotas: quotas.entries,
+      keyDir,
+      cache: await cacheOf(p.id),
+    });
+    p.accounts = built.accounts;
+    p.autoAccountModels = built.autoAccountModels;
+    p.autoModel = built.autoAccountModels
+      ? (pickAutoModel(built.autoAccountModels.map((id) => ({ id })))?.id ?? null)
+      : null;
   }
   list.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   return { providers: list };
@@ -393,16 +365,21 @@ function usableChatBody(text: string): boolean {
   }
 }
 
+/** 预热消息固定为 hi：探活用，不可配置（页面与校验都不再收自定义消息） */
+export const WARMUP_MESSAGE = "hi";
+
 /**
- * 发一次预热消息。只有一次请求，成败都如实上报：
+ * 发一次预热消息。pin 是调度器按统一账号规则算好的账号头值（null = 不带头，网关自动选）。
+ * 只有一次请求，成败都如实上报：
  * - 2xx 且响应体是 JSON 对象 → ok
  * - HTTP 错误 → failed（原因 = 状态码 + 上游 error.message）
- * - 连不上 → failed
+ * - 连不上 → failed（原因是底层原始错误）
  * - 超时 / 外部取消 / 2xx 但响应体读不出来 → unknown（请求可能已送达，不允许上层据此自动重发）
  */
 export async function send(
   base: string,
-  task: Pick<Task, "id" | "account" | "model" | "message">,
+  task: Pick<Task, "id" | "model">,
+  pin: string | null,
   effort: string | null,
   signal: AbortSignal,
   timeoutMs: number = SEND_TIMEOUT_MS,
@@ -415,11 +392,16 @@ export async function send(
     "content-type": "application/json",
     "x-magpie-session": `window-warmup/${task.id}`,
   };
-  // 固定账号用头指定；留空则由网关自动选账号
-  if (task.account) headers["x-magpie-account"] = task.account;
+  if (pin) {
+    // 头值只能按 latin-1 写上线路：含非 ASCII（如中文账号名）时改存 UTF-8 字节，
+    // 网关侧按字节收到原文（HTTP 头按字节透传）
+    headers["x-magpie-account"] = /[^\x00-\x7F]/.test(pin)
+      ? Buffer.from(pin, "utf8").toString("latin1")
+      : pin;
+  }
   const body: Record<string, unknown> = {
     model: task.model,
-    messages: [{ role: "user", content: task.message }],
+    messages: [{ role: "user", content: WARMUP_MESSAGE }],
     max_tokens: SEND_MAX_TOKENS,
     stream: false,
   };
@@ -435,14 +417,14 @@ export async function send(
     });
   } catch (e) {
     // 外部取消优先于超时上报；连接被重置说明请求多半已送达、响应丢了，
-    // 属「结果未知」而不是「连不上」；都未触发才是连接层失败
+    // 属「结果未知」而不是「连不上」；都未触发才是连接层失败（原始错误如实上报）
     if (signal.aborted) return { outcome: "unknown", reason: "发送被取消", ms: elapsed() };
     if (timer.aborted) return { outcome: "unknown", reason: timeoutReason(timeoutMs), ms: elapsed() };
     const code = (e as NodeJS.ErrnoException).code;
     if (code === "ECONNRESET" || code === "EPIPE") {
       return { outcome: "unknown", reason: "连接中断，结果未知（可能已发送）", ms: elapsed() };
     }
-    return { outcome: "failed", reason: `连不上 Magpie（${base}）`, ms: elapsed() };
+    return { outcome: "failed", reason: errText(e), ms: elapsed() };
   }
   let text = "";
   let bodyBroken = false;

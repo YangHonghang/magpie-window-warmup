@@ -1,5 +1,12 @@
 // 测试与 --serve 演示共用的假 Magpie 网关：只在本机回环上应答，不发任何真实请求。
 // 请求全部按到达顺序记进 requests，供断言请求体与请求头。
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// 测试进程绝不读真实用户的 Magpie 配置：把目录推导用的 XDG 钉到临时位置
+// （fetchCatalog 与调度器的兜底读取会走 magpieDirs 的默认路径）
+process.env.XDG_CONFIG_HOME = join(tmpdir(), "window-warmup-test-magpie-config");
+process.env.XDG_CACHE_HOME = join(tmpdir(), "window-warmup-test-magpie-cache");
 
 export interface FakeChatReply {
   status?: number;

@@ -1,3 +1,4 @@
+import { WARMUP_MESSAGE } from "./gateway";
 import type { QuotaWindow, Task, Trigger } from "./types";
 
 const MINUTE_MS = 60_000;
@@ -6,9 +7,8 @@ const HOUR_MS = 3_600_000;
 const RESET_GRACE_MS = 30_000;
 /** 补发判断向前回看 48 小时：跨夏令时的日间隔最多 25 小时，足以覆盖最近一个应到点 */
 const LAST_DUE_LOOKBACK_MS = 48 * HOUR_MS;
-/** 名称/消息的长度上限按 Unicode 码点计，与页面字数一致 */
+/** 名称的长度上限按 Unicode 码点计，与页面字数一致 */
 const NAME_MAX = 40;
-const MESSAGE_MAX = 200;
 
 interface Wall {
   year: number;
@@ -262,15 +262,8 @@ export function validateTask(
   const model = typeof raw.model === "string" ? raw.model.trim() : "";
   if (model.startsWith("group/")) return { error: "不支持路由组模型", field: "model" };
 
-  let message = "hi";
-  if (raw.message !== undefined && raw.message !== null) {
-    if (typeof raw.message !== "string") return { error: "消息内容必须是文本", field: "message" };
-    const len = [...raw.message].length;
-    if (len < 1 || len > MESSAGE_MAX) {
-      return { error: `消息内容需为 1–${MESSAGE_MAX} 字`, field: "message" };
-    }
-    message = raw.message;
-  }
+  // 消息固定 hi（探活）：入参里的 message 忽略，字段只为旧数据兼容保留
+  const message = WARMUP_MESSAGE;
 
   let enabled = true;
   if (raw.enabled !== undefined && raw.enabled !== null) {

@@ -14,7 +14,7 @@ export interface Task {
   account: string;
   /** "" 表示自动选模型：每次发送前按 pickAutoModel 现算，任务里不存选中值 */
   model: string;
-  /** 1–200 字，缺省 "hi" */
+  /** 恒为 "hi"（探活消息固定，字段只为旧数据保留） */
   message: string;
   trigger: Trigger;
   createdAt: string;
@@ -62,6 +62,8 @@ export interface QuotaEntry {
   account: string;
   label: string;
   windows: QuotaWindow[];
+  /** true = 远程 Magpie 给单把 key 发的限额卡（原 provider 形如 "<p>/~keys"，user 是 key 名或打码） */
+  viaKey: boolean;
 }
 
 /** /v1/models 的单条原始对象；档位字段形状随模型而变，使用前需运行时校验 */
@@ -74,9 +76,18 @@ export interface RawModel {
 }
 
 export interface CatalogAccount {
+  /** key 账号：key 指纹；订阅账号：额度卡 user */
   id: string;
+  /** key 名（没起名用指纹）或账号名 */
   label: string;
+  kind: "key" | "login";
   windows: QuotaWindow[];
+  /** 该账号可选的模型（/v1/models 的完整 id，升序）；null = 该供应商既无模型缓存、/v1/models 里也没有它的模型 */
+  models: string[] | null;
+  /** false = 没有模型缓存，models 是该供应商的全部模型（未按账号区分） */
+  perAccount: boolean;
+  /** 该账号的自动选模型；models 为 null 或空时为 null */
+  autoModel: string | null;
 }
 
 export interface CatalogModel {
@@ -88,7 +99,9 @@ export interface CatalogProvider {
   id: string;
   accounts: CatalogAccount[];
   models: CatalogModel[];
-  /** 服务端用与调度器同一套规则算好的自动选模型；供应商没有模型时为 null */
+  /** 「自动选账号」的可选模型（完整 id，升序）；null = 既无模型缓存也无 /v1/models 模型 */
+  autoAccountModels: string[] | null;
+  /** 「自动选账号」时的自动选模型 */
   autoModel: string | null;
 }
 

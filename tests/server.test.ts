@@ -2,9 +2,10 @@
 // 覆盖：静态首页注入 boot JSON、鉴权（token/Host/Origin）、CRUD 与立即发送往返、
 // 状态文件损坏（fatal）、单实例锁被占（lockedBy）。
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix, win32 } from "node:path";
+import plugin from "../src/plugin";
 import { buildAll } from "../scripts/build";
 import { insideDir, startService, type ServiceHandle } from "../src/server";
 import { fakeGateway, type FakeGateway } from "./fake-gateway";
@@ -89,6 +90,8 @@ test("首页注入 nonce boot JSON（含 token）并带 CSP", async () => {
   expect(csp).toContain(`nonce-${nonce}`);
   expect(token).toMatch(/^[0-9a-f]{64}$/); // 32 字节 hex
   expect(token).not.toContain("<");
+  // 本插件服务的自标记：plugin.ts 启动前探测它，识别「已经在跑」
+  expect(res.headers.get("x-window-warmup")).toBe("1");
   // 首页带着口令，绝不能带 CORS——别的页面读不到它
   expect(res.headers.get("access-control-allow-origin")).toBeNull();
 });
@@ -411,4 +414,63 @@ test("静态文件目录判定按平台分隔符：Windows 下 ui 目录内文�
   expect(insideDir(winRoot, winRoot, win32)).toBe(false);
   expect(insideDir("/srv/ui", "/srv/ui/app.js", posix)).toBe(true);
   expect(insideDir("/srv/ui", "/srv/ui-evil/app.js", posix)).toBe(false);
+});
+
+// ---------- 端口探测（plugin.ts）：已有实例不重开，被占不静默 ----------
+
+/** 在测试期间把数据目录指到指定路径 */
+function withDir(dir: string): () => void {
+  const saved = process.env.WINDOW_WARMUP_DIR;
+  process.env.WINDOW_WARMUP_DIR = dir;
+  return () => {
+    if (saved === undefined) delete process.env.WINDOW_WARMUP_DIR;
+    else process.env.WINDOW_WARMUP_DIR = saved;
+  };
+}
+
+test("端口探测：已有本插件的服务（带标记头）→ 直接返回，不重开数据目录", async () => {
+  const marker = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch: () => new Response("{}", { headers: { "x-window-warmup": "1" } }),
+  });
+  // 故意用不存在的目录：startService 一旦被调就会 mkdir 出来
+  const dir = join(tmpdir(), `ww-plugin-absent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const restore = withDir(dir);
+  try {
+    expect(await plugin.server(null, { port: marker.port })).toEqual({});
+  } finally {
+    restore();
+    marker.stop(true);
+  }
+  expect(await stat(dir).then(() => true, () => false)).toBe(false);
+});
+
+test("端口探测：端口空闲 → 照常启动，响应带标记头", async () => {
+  const probe = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("x") });
+  const port = probe.port;
+  probe.stop(true);
+  const dir = await mkdtemp(join(tmpdir(), "ww-plugin-run-"));
+  dirs.push(dir);
+  const restore = withDir(dir);
+  try {
+    expect(await plugin.server(null, { port })).toEqual({});
+    const res = await fetch(`http://127.0.0.1:${port}/`);
+    expect(res.headers.get("x-window-warmup")).toBe("1");
+  } finally {
+    restore();
+  }
+});
+
+test("端口探测：被别的服务（无标记头）占用 → 抛原错误，不静默成功", async () => {
+  const other = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("not ours") });
+  const dir = await mkdtemp(join(tmpdir(), "ww-plugin-clash-"));
+  dirs.push(dir);
+  const restore = withDir(dir);
+  try {
+    await expect(plugin.server(null, { port: other.port })).rejects.toThrow();
+  } finally {
+    restore();
+    other.stop(true);
+  }
 });

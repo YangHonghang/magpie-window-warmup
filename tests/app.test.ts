@@ -2,7 +2,9 @@
 // statusOf / trigText / 下拉选项构造 / 执行记录文案等由 web/app.ts 导出，界面渲染直接复用。
 import { expect, test } from "bun:test";
 import {
+  accountModelView,
   accountOptions,
+  contentOf,
   deleteArmed,
   DELETE_CONFIRM_MS,
   effortLabel,
@@ -25,9 +27,13 @@ import {
   validateDraft,
   windowOptions,
 } from "../web/app";
-import type { CatalogProvider, Run, Task, Trigger } from "../src/types";
+import type { CatalogAccount, CatalogProvider, Run, Task, Trigger } from "../src/types";
 
 const T0 = new Date("2026-10-31T12:00:00+08:00"); // 周六 12:00，本地（nextLabel 看本地时间）
+
+/** 假想的 key 指纹（10 位小写 hex），页面的 key 账号 id 都长这样 */
+const FP1 = "1a2b3c4d5e";
+const FP2 = "f0e1d2c3b4";
 
 const p2 = (n: number): string => String(n).padStart(2, "0");
 
@@ -70,6 +76,20 @@ function mkProvider(over: Partial<CatalogProvider> = {}): CatalogProvider {
     id: "remote-magpie",
     accounts: [],
     models: [],
+    autoAccountModels: null,
+    autoModel: null,
+    ...over,
+  };
+}
+
+function mkAccount(over: Partial<CatalogAccount> = {}): CatalogAccount {
+  return {
+    id: "a1",
+    label: "a1",
+    kind: "login",
+    windows: [],
+    models: null,
+    perAccount: false,
     autoModel: null,
     ...over,
   };
@@ -127,14 +147,25 @@ test("shortModel / modelDisplay：取末段、剥供应商前缀", () => {
   expect(modelDisplay("gpt-5.2", "openai")).toBe("gpt-5.2");
 });
 
-test("rowSub：触发 · 账号 · 模型，空值给「自动」占位", () => {
-  expect(rowSub(mkTask({ account: "acct-yang", model: "openai/gpt-5.2-chat" }))).toBe(
-    "每天 06:00 · acct-yang · gpt-5.2-chat",
+test("rowSub：账号显示目录里的 label，找不到（旧值/目录暂缺）用原值", () => {
+  const providers = [
+    mkProvider({ id: "openai", accounts: [mkAccount({ id: FP1, label: "主 Key", kind: "key" })] }),
+  ];
+  expect(rowSub(mkTask({ provider: "openai", account: FP1, model: "openai/gpt-5.2-chat" }), providers)).toBe(
+    "每天 06:00 · 主 Key · gpt-5.2-chat",
   );
-  expect(rowSub(mkTask({ account: "", model: "" }))).toBe("每天 06:00 · 自动选账号 · 自动选模型");
-  expect(rowSub(mkTask({ trigger: { kind: "window", window: "week" } }))).toBe(
+  // 旧任务存的 key 名不在目录：原样显示，不改写
+  expect(rowSub(mkTask({ provider: "openai", account: "sk-legacy" }), providers)).toBe(
+    "每天 06:00 · sk-legacy · 自动选模型",
+  );
+  expect(rowSub(mkTask({ provider: "openai", account: "" }), providers)).toBe(
+    "每天 06:00 · 自动选账号 · 自动选模型",
+  );
+  expect(rowSub(mkTask({ trigger: { kind: "window", window: "week" } }), providers)).toBe(
     "窗口 week 重置后 · 自动选账号 · 自动选模型",
   );
+  // 目录整体暂缺：退回原值
+  expect(rowSub(mkTask({ account: FP1 }), [])).toBe(`每天 06:00 · ${FP1} · 自动选模型`);
 });
 
 test("runOutcome：成功灰、失败红、未知琥珀、发送中灰", () => {
@@ -186,46 +217,96 @@ test("nextLabel：今天 HH:MM / 明天 / M/D（取 UTC 与 +08 同日期的时�
   expect(nextLabel("2026-11-05T06:00:00Z", T0)).toMatch(/^11\/5 \d{2}:\d{2}$/);
 });
 
-test("accountOptions：窗口触发不给自动项；带目录账号；未知当前值保留", () => {
+test("accountOptions：自动项；key 账号 label + 指纹附注；旧账号保留并标注", () => {
   const providers = [
     mkProvider({
       id: "remote-magpie",
       accounts: [
-        { id: "acct-yang", label: "Yang 主账号", windows: [] },
-        { id: "GLM", label: "GLM", windows: [] },
+        mkAccount({ id: "acct-team", label: "acct-team" }),
+        mkAccount({ id: FP1, label: "主 Key", kind: "key" }),
+        mkAccount({ id: FP2, label: FP2, kind: "key" }), // 没起名的 key：label 就是指纹
       ],
     }),
   ];
   const withAuto = accountOptions("remote-magpie", "", true, providers);
-  expect(withAuto[0]).toEqual({ value: "", text: "自动选择" });
-  expect(withAuto.map((o) => o.text)).toContain("Yang 主账号（acct-yang）");
-  expect(withAuto.map((o) => o.text)).toContain("GLM");
+  expect(withAuto[0]).toEqual({ value: "", text: "自动（由 Magpie 选）" });
+  expect(withAuto[1]).toEqual({ value: "acct-team", text: "acct-team" });
+  expect(withAuto[2]).toEqual({ value: FP1, text: "主 Key", aux: FP1 });
+  expect(withAuto[3]).toEqual({ value: FP2, text: FP2 });
 
   const noAuto = accountOptions("remote-magpie", "", false, providers);
   expect(noAuto.some((o) => o.value === "")).toBe(false);
-  expect(noAuto[0].value).toBe("acct-yang");
+  expect(noAuto[0].value).toBe("acct-team");
 
-  // 已保存任务里的账号不在目录（额度接口挂了等）：保留原值避免静默改写
-  const stale = accountOptions("remote-magpie", "legacy-acct", false, providers);
-  expect(stale[0]).toEqual({ value: "legacy-acct", text: "legacy-acct" });
+  // 旧任务里的账号（key 名或已删除的账号）不在目录：保留原值不自动改写，标注「不在当前账号列表」
+  const stale = accountOptions("remote-magpie", "sk-legacy", false, providers);
+  expect(stale[0]).toEqual({ value: "sk-legacy", text: "sk-legacy（不在当前账号列表）" });
 });
 
-test("modelOptions：首项自动附注小模型优先，模型剥前缀，未知当前值保留", () => {
+test("accountModelView：指定账号用其列表；自动与目录暂缺的账号退回供应商全集", () => {
+  const provider = mkProvider({
+    id: "p",
+    accounts: [
+      mkAccount({ id: FP1, label: "主 Key", kind: "key", models: ["p/a"], autoModel: "p/a", perAccount: true }),
+      mkAccount({ id: "acct-z", label: "acct-z", models: null, perAccount: false, autoModel: null }),
+    ],
+    autoAccountModels: ["p/a", "p/b"],
+    autoModel: "p/b",
+  });
+  expect(accountModelView(provider, FP1)).toEqual({ models: ["p/a"], autoModel: "p/a", perAccount: true });
+  expect(accountModelView(provider, "acct-z")).toEqual({ models: null, autoModel: null, perAccount: false });
+  expect(accountModelView(provider, "")).toEqual({ models: ["p/a", "p/b"], autoModel: "p/b", perAccount: null });
+  // 目录暂缺的账号（旧任务存的名字）：退回全集不禁用，此时无从判断是否按账号区分
+  expect(accountModelView(provider, "sk-legacy")).toEqual({ models: ["p/a", "p/b"], autoModel: "p/b", perAccount: null });
+  expect(accountModelView(undefined, "")).toEqual({ models: null, autoModel: null, perAccount: null });
+});
+
+test("modelOptions：首项自动附注当前账号的自动模型；列表来自所选账号；旧值保留", () => {
   const providers = [
     mkProvider({
       id: "remote-magpie",
-      models: [
-        { id: "remote-magpie/group/glm-5.3", effort: { send: "low", label: "low" } },
-        { id: "remote-magpie/qwen/qwen3.8-flash", effort: { send: null, label: "不适用" } },
+      accounts: [
+        mkAccount({
+          id: FP1,
+          label: "主 Key",
+          kind: "key",
+          models: ["remote-magpie/glm-4.7"],
+          autoModel: "remote-magpie/glm-4.7",
+          perAccount: true,
+        }),
+        mkAccount({ id: "acct-z", label: "acct-z", models: null, perAccount: false, autoModel: null }),
       ],
-      autoModel: "remote-magpie/qwen/qwen3.8-flash",
+      autoAccountModels: [
+        "remote-magpie/glm-4.7",
+        "remote-magpie/glm-5.3",
+        "remote-magpie/glm-5.3-flash",
+      ],
+      autoModel: "remote-magpie/glm-5.3-flash",
     }),
   ];
-  const opts = modelOptions("remote-magpie", "", providers);
-  expect(opts[0]).toEqual({ value: "", text: "自动", aux: "小模型优先" });
-  expect(opts.slice(1).map((o) => o.text)).toEqual(["group/glm-5.3", "qwen/qwen3.8-flash"]);
-  const stale = modelOptions("remote-magpie", "remote-magpie/gone-model", providers);
-  expect(stale[1]).toEqual({ value: "remote-magpie/gone-model", text: "remote-magpie/gone-model" });
+  const byAccount = modelOptions("remote-magpie", FP1, "", providers);
+  expect(byAccount[0]).toEqual({ value: "", text: "自动", aux: "glm-4.7" });
+  expect(byAccount.slice(1).map((o) => o.text)).toEqual(["glm-4.7"]);
+
+  // 自动账号用供应商全集，附注是供应商级的自动模型
+  const autoAcct = modelOptions("remote-magpie", "", "", providers);
+  expect(autoAcct[0].aux).toBe("glm-5.3-flash");
+  expect(autoAcct.slice(1).map((o) => o.value)).toEqual([
+    "remote-magpie/glm-4.7",
+    "remote-magpie/glm-5.3",
+    "remote-magpie/glm-5.3-flash",
+  ]);
+
+  // 已存模型不在当前账号列表：保留原值不自动改写（打开旧任务不重置，重置只发生在主动切换时）
+  const stale = modelOptions("remote-magpie", FP1, "remote-magpie/gone", providers);
+  expect(stale[1]).toEqual({ value: "remote-magpie/gone", text: "remote-magpie/gone" });
+
+  // 列表为 null：只有自动 + 旧值，渲染层据此禁用下拉并显示提示 B
+  const none = modelOptions("remote-magpie", "acct-z", "remote-magpie/gone", providers);
+  expect(none).toEqual([
+    { value: "", text: "自动" },
+    { value: "remote-magpie/gone", text: "remote-magpie/gone" },
+  ]);
 });
 
 test("windowOptions：账号的窗口带已用与重置附注；无账号 / 无窗口给占位", () => {
@@ -234,7 +315,7 @@ test("windowOptions：账号的窗口带已用与重置附注；无账号 / 无�
     mkProvider({
       id: "p",
       accounts: [
-        {
+        mkAccount({
           id: "a1",
           label: "",
           windows: [
@@ -242,7 +323,7 @@ test("windowOptions：账号的窗口带已用与重置附注；无账号 / 无�
             { name: "week", used: 30, resetsAt: null },
             { name: "long", used: null, resetsAt: null },
           ],
-        },
+        }),
       ],
     }),
   ];
@@ -260,7 +341,7 @@ test("windowOptions：账号的窗口带已用与重置附注；无账号 / 无�
 
 test("forceWindowAccount：窗口触发缺账号时取该供应商第一个账号", () => {
   const providers = [
-    mkProvider({ id: "p1", accounts: [{ id: "a1", label: "", windows: [] }] }),
+    mkProvider({ id: "p1", accounts: [mkAccount({ id: "a1", label: "" })] }),
     mkProvider({ id: "p2", accounts: [] }),
   ];
   expect(forceWindowAccount("p1", providers)).toBe("a1");
@@ -268,28 +349,45 @@ test("forceWindowAccount：窗口触发缺账号时取该供应商第一个账�
   expect(forceWindowAccount("nope", providers)).toBe("");
 });
 
-test("modelHint：固定模型只给思考；自动给自动选中；没有可用模型给提示", () => {
+test("modelHint：固定模型只给思考；自动按所选账号给自动选中；没有可用模型给提示", () => {
   const provider = mkProvider({
     id: "p",
+    accounts: [
+      mkAccount({ id: "acct-a", label: "acct-a", models: ["p/small"], autoModel: "p/small" }),
+    ],
     autoModel: "p/glm-5.3-flash",
     models: [
       { id: "p/glm-5.3-flash", effort: { send: null, label: "不适用" } },
       { id: "p/big", effort: { send: "low", label: "low（模型必须思考，已用最低档）" } },
     ],
   });
-  const fixed = modelHint("p/big", provider);
+  const fixed = modelHint("p/big", provider, "acct-a");
   expect(fixed.main).toBe("思考：low（模型必须思考，已用最低档）");
   expect(fixed.sub).toBe("思考档位按这个模型的配置自动决定：能关就关，不能关用最低档。");
 
-  const auto = modelHint("", provider);
+  const auto = modelHint("", provider, "");
   expect(auto.main).toBe("自动选中 glm-5.3-flash · 思考：不适用");
   expect(auto.sub).toBe(
     "名字带 flash / lite / mini 的小模型优先，每次发送前重新选；思考能关就关，不能关用最低档。",
   );
+  // 指定账号的自动模型与供应商级不同，按账号的来
+  const byAccount = modelHint("", provider, "acct-a");
+  expect(byAccount.main).toBe("自动选中 small · 思考：目录里暂时没有这个模型");
 
-  const none = modelHint("", mkProvider({ id: "p2", autoModel: null }));
+  const none = modelHint("", mkProvider({ id: "p2", autoModel: null }), "");
   expect(none.main).toBe("该供应商没有可用模型");
-  const missing = modelHint("p/gone", provider);
+  // 指定了账号却选不出模型：归因到账号，不能写成整个供应商没有
+  const emptyAccount = modelHint(
+    "",
+    mkProvider({
+      id: "p3",
+      accounts: [mkAccount({ id: "acct-b", label: "acct-b", models: [], autoModel: null })],
+      autoModel: "p3/any",
+    }),
+    "acct-b",
+  );
+  expect(emptyAccount.main).toBe("这个账号没有可用模型");
+  const missing = modelHint("p/gone", provider, "");
   expect(missing.main).toBe("思考：目录里暂时没有这个模型");
 });
 
@@ -352,6 +450,11 @@ test("syncDraftOnPoll：未保存编辑优先；外部更新提示；任务删�
   expect(syncDraftOnPoll(saved, "2026-10-31T08:00:00+08:00", false)).toBe("adopt");
   expect(syncDraftOnPoll(saved, "2026-10-31T08:00:00+08:00", true)).toBe("keep");
   expect(syncDraftOnPoll(saved, "2026-10-30T08:00:00+08:00", true)).toBe("stale");
+});
+
+test("contentOf：保存内容只含六个字段，不再带 message（探活消息固定 hi，由服务端填）", () => {
+  const keys = Object.keys(contentOf(mkTask({ message: "hi" }))).sort();
+  expect(keys).toEqual(["account", "enabled", "model", "name", "provider", "trigger"]);
 });
 
 test("validateDraft：名称 / 供应商 / 窗口账号与窗口名必填", () => {
