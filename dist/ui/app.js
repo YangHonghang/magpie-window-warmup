@@ -1551,9 +1551,8 @@ function renderBars() {
   if (reconnecting || netError) {
     const note = el("div", "notice bad");
     note.append(reconnecting ? t("与服务断开了，正在自动重连…") : document.createTextNode(`${t("页面与服务断开了：")}${netError}${t("（服务可能已退出，重新打开页面试试）")}`));
-    const retry = el("button", "btn", t("重试"));
+    const retry = el("button", "link", t("重试"));
     retry.type = "button";
-    retry.style.marginLeft = "8px";
     retry.addEventListener("click", reconnectNow);
     note.append(retry);
     nodes.push(note);

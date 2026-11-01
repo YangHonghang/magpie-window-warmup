@@ -1830,9 +1830,9 @@ function renderBars(): void {
         ? t("与服务断开了，正在自动重连…")
         : document.createTextNode(`${t("页面与服务断开了：")}${netError}${t("（服务可能已退出，重新打开页面试试）")}`),
     );
-    const retry = el("button", "btn", t("重试")) as HTMLButtonElement;
+    // 文字按钮（同「立即发送一次」的 .link）：提示条里再放一枚带边框的实心按钮会显得突兀
+    const retry = el("button", "link", t("重试")) as HTMLButtonElement;
     retry.type = "button";
-    retry.style.marginLeft = "8px";
     retry.addEventListener("click", reconnectNow);
     note.append(retry);
     nodes.push(note);
