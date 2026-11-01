@@ -94,6 +94,7 @@ var I18N = {
     "下一次": "Next",
     "页面与服务断开了：": "The page lost contact with the service: ",
     "（服务可能已退出，重新打开页面试试）": " (the service may have exited; try reopening the page)",
+    "与服务断开了，正在自动重连…": "Disconnected from the service; reconnecting automatically…",
     "服务处于故障状态，任务没有在运行：": "The service is in a failed state; tasks are not running: ",
     "另一个实例正在运行（进程 ": "Another instance is running (process ",
     "），本页只读。": "); this page is read-only.",
@@ -204,6 +205,7 @@ var I18N = {
     "下一次": "下一次",
     "页面与服务断开了：": "頁面與服務的連線中斷：",
     "（服务可能已退出，重新打开页面试试）": "（服務可能已結束，重新開啟頁面試試）",
+    "与服务断开了，正在自动重连…": "與服務的連線中斷，正在自動重新連線…",
     "服务处于故障状态，任务没有在运行：": "服務處於故障狀態，任務沒有在執行：",
     "另一个实例正在运行（进程 ": "另一個執行個體正在執行（處理程序 ",
     "），本页只读。": "），本頁唯讀。",
@@ -314,6 +316,7 @@ var I18N = {
     "下一次": "次回",
     "页面与服务断开了：": "ページとサービスの接続が切れました：",
     "（服务可能已退出，重新打开页面试试）": "（サービスが終了した可能性があります。ページを開き直してみてください）",
+    "与服务断开了，正在自动重连…": "サービスと切断されました。自動的に再接続しています…",
     "服务处于故障状态，任务没有在运行：": "サービスは故障状態にあり、タスクは実行されていません：",
     "另一个实例正在运行（进程 ": "別のインスタンスが実行中（プロセス ",
     "），本页只读。": "）。このページは閲覧のみです。",
@@ -728,6 +731,8 @@ var state = null;
 var catalog = null;
 var catalogError = "";
 var netError = "";
+var fetchFails = 0;
+var reconnecting = false;
 var actionError = "";
 var openId = null;
 var draft = null;
@@ -1540,7 +1545,9 @@ function renderBars() {
   if (!bars)
     return;
   const nodes = [];
-  if (netError)
+  if (reconnecting)
+    nodes.push(el("div", "notice bad", t("与服务断开了，正在自动重连…")));
+  else if (netError)
     nodes.push(el("div", "notice bad", `${t("页面与服务断开了：")}${netError}${t("（服务可能已退出，重新打开页面试试）")}`));
   if (state?.fatal)
     nodes.push(el("div", "notice bad", `${t("服务处于故障状态，任务没有在运行：")}${state.fatal}`));
@@ -1567,9 +1574,19 @@ async function refreshState() {
   try {
     state = await apiJSON("api/state");
     netError = "";
+    fetchFails = 0;
     actionError = "";
   } catch (e) {
     netError = errText(e);
+    fetchFails++;
+    if (!reconnecting && fetchFails >= 2 && document.referrer && document.referrer !== location.href) {
+      reconnecting = true;
+      render();
+      setTimeout(() => {
+        location.href = document.referrer;
+      }, 1500);
+      return;
+    }
     render();
     return;
   }

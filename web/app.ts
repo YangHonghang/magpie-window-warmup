@@ -120,6 +120,7 @@ export const I18N: Partial<Record<Lang, I18NTable>> = {
     "下一次": "Next",
     "页面与服务断开了：": "The page lost contact with the service: ",
     "（服务可能已退出，重新打开页面试试）": " (the service may have exited; try reopening the page)",
+    "与服务断开了，正在自动重连…": "Disconnected from the service; reconnecting automatically…",
     "服务处于故障状态，任务没有在运行：": "The service is in a failed state; tasks are not running: ",
     "另一个实例正在运行（进程 ": "Another instance is running (process ",
     "），本页只读。": "); this page is read-only.",
@@ -242,6 +243,7 @@ export const I18N: Partial<Record<Lang, I18NTable>> = {
     "下一次": "下一次",
     "页面与服务断开了：": "頁面與服務的連線中斷：",
     "（服务可能已退出，重新打开页面试试）": "（服務可能已結束，重新開啟頁面試試）",
+    "与服务断开了，正在自动重连…": "與服務的連線中斷，正在自動重新連線…",
     "服务处于故障状态，任务没有在运行：": "服務處於故障狀態，任務沒有在執行：",
     "另一个实例正在运行（进程 ": "另一個執行個體正在執行（處理程序 ",
     "），本页只读。": "），本頁唯讀。",
@@ -364,6 +366,7 @@ export const I18N: Partial<Record<Lang, I18NTable>> = {
     "下一次": "次回",
     "页面与服务断开了：": "ページとサービスの接続が切れました：",
     "（服务可能已退出，重新打开页面试试）": "（サービスが終了した可能性があります。ページを開き直してみてください）",
+    "与服务断开了，正在自动重连…": "サービスと切断されました。自動的に再接続しています…",
     "服务处于故障状态，任务没有在运行：": "サービスは故障状態にあり、タスクは実行されていません：",
     "另一个实例正在运行（进程 ": "別のインスタンスが実行中（プロセス ",
     "），本页只读。": "）。このページは閲覧のみです。",
@@ -930,6 +933,9 @@ let state: StateView | null = null;
 let catalog: Catalog | null = null;
 let catalogError = "";
 let netError = "";
+/** 连续失败计数与自动重连状态：服务死掉后页面自己走带路页把宿主拉起来，不用人停启用 */
+let fetchFails = 0;
+let reconnecting = false;
 /** 行内操作（开关/删除）失败时的提示；成功刷新后清除 */
 let actionError = "";
 let openId: string | null = null;
@@ -1814,7 +1820,8 @@ function renderBars(): void {
   const bars = document.getElementById("bars");
   if (!bars) return;
   const nodes: HTMLElement[] = [];
-  if (netError) nodes.push(el("div", "notice bad", `${t("页面与服务断开了：")}${netError}${t("（服务可能已退出，重新打开页面试试）")}`));
+  if (reconnecting) nodes.push(el("div", "notice bad", t("与服务断开了，正在自动重连…")));
+  else if (netError) nodes.push(el("div", "notice bad", `${t("页面与服务断开了：")}${netError}${t("（服务可能已退出，重新打开页面试试）")}`));
   if (state?.fatal) nodes.push(el("div", "notice bad", `${t("服务处于故障状态，任务没有在运行：")}${state.fatal}`));
   if (state && typeof state.lockedBy === "number") {
     nodes.push(el("div", "notice warn", state.lockedBy > 0
@@ -1841,9 +1848,22 @@ async function refreshState(): Promise<void> {
   try {
     state = await apiJSON<StateView>("api/state");
     netError = "";
+    fetchFails = 0;
     actionError = "";
   } catch (e) {
     netError = errText(e);
+    fetchFails++;
+    // 服务退出后，这个框架还停在 127.0.0.1 的死地址上：手动刷新只会再撞一次，
+    // 只有重新经过 magpie 的带路页（或停用再启用插件）宿主才会被拉起来。
+    // 连续两轮取不到状态，就自己导航回带路页：宿主起来 → 带路页转回本页，全程无需人管
+    if (!reconnecting && fetchFails >= 2 && document.referrer && document.referrer !== location.href) {
+      reconnecting = true;
+      render();
+      setTimeout(() => {
+        location.href = document.referrer;
+      }, 1_500);
+      return;
+    }
     render();
     return;
   }
