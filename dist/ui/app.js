@@ -10,6 +10,11 @@ var RUNS_MAX = 50;
 var DELETE_CONFIRM_MS = 3000;
 var MODEL_SOURCE_HINT = "模型列表来自 Magpie 上次获取的结果。账号和模型对不上时，到 Magpie「供应商」里打开这个供应商，点「获取模型」，再回来刷新本页。";
 var NO_MODELS_HINT = "还没有这个供应商的模型列表。请到 Magpie「供应商」里打开它，点「获取模型」。";
+var TRIGGERS = [
+  ["window", "窗口重置后"],
+  ["daily", "每天定时"],
+  ["every", "固定间隔"]
+];
 function statusOf(task, runs) {
   if (!task.enabled)
     return { tone: "", text: "已停用" };
@@ -165,6 +170,12 @@ function windowAux(w) {
     parts.push(`已用 ${Math.round(w.used)}%`);
   parts.push(w.resetsAt ? `${hm(new Date(w.resetsAt))} 重置` : "空闲");
   return parts.join(" · ");
+}
+function accountHasWindows(providerId, accountId, providers) {
+  if (!accountId)
+    return false;
+  const acct = providers.find((p) => p.id === providerId)?.accounts.find((a) => a.id === accountId);
+  return (acct?.windows.length ?? 0) > 0;
 }
 function windowOptions(providerId, accountId, current, providers) {
   const provider = providers.find((p) => p.id === providerId);
@@ -751,6 +762,11 @@ function buildEditor() {
   const providers = catalog?.providers ?? [];
   const provider = providers.find((p) => p.id === d.provider);
   const ed = el("div", "editor");
+  let droppedWindow = false;
+  if (d.trigger.kind === "window" && !accountHasWindows(d.provider, d.account, providers)) {
+    d.trigger = { kind: "daily", time: "06:00", timeZone: localTZ() };
+    droppedWindow = true;
+  }
   const saved = currentSavedTask();
   if (saved && d.enabled) {
     const last = latestRunOf(saved.id);
@@ -835,8 +851,11 @@ function buildEditor() {
     parts.push(el("div", "hint mute", "跟随窗口重置时必须指定账号，每个账号的窗口各自计时。"));
   }
   row(ed, "发送到", ...parts);
+  const hasWindows = accountHasWindows(d.provider, d.account, providers);
   const seg = el("div", "seg");
-  for (const [k, txt] of [["window", "窗口重置后"], ["daily", "每天定时"], ["every", "固定间隔"]]) {
+  for (const [k, txt] of TRIGGERS) {
+    if (k === "window" && !hasWindows)
+      continue;
     const b = el("button", d.trigger.kind === k ? "on" : "", txt);
     b.type = "button";
     b.addEventListener("click", () => {
@@ -941,6 +960,9 @@ function buildEditor() {
       dates.push(...nextPointsAfter(d.trigger, now, 3));
     }
     nextEl.append("接下来 ", el("b", undefined, dates.length ? dates.map((x) => nextLabel(x.toISOString(), now)).join(" · ") : "—"));
+  }
+  if (droppedWindow) {
+    nextEl.prepend(el("div", "hint mute", "这个账号没有可跟随的窗口，已改为每天定时，保存后生效。"));
   }
   row(ed, "触发", seg, line, nextEl);
   const act = el("div", "actions full");
@@ -1268,6 +1290,7 @@ if (typeof document !== "undefined") {
 }
 export {
   DELETE_CONFIRM_MS,
+  accountHasWindows,
   accountModelView,
   accountOptions,
   contentOf,

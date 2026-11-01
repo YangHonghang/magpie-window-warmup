@@ -2,6 +2,7 @@
 // statusOf / trigText / 下拉选项构造 / 执行记录文案等由 web/app.ts 导出，界面渲染直接复用。
 import { expect, test } from "bun:test";
 import {
+  accountHasWindows,
   accountModelView,
   accountOptions,
   contentOf,
@@ -474,4 +475,21 @@ test("validateDraft：名称 / 供应商 / 窗口账号与窗口名必填", () =
     field: "time",
   });
   expect(validateDraft(mkTask())).toBeNull();
+});
+
+test("accountHasWindows：没账号、不在目录、没有窗口都算没有——此时不提供「窗口重置后」", () => {
+  const provider = mkProvider({
+    id: "p",
+    accounts: [
+      mkAccount({ id: "with-win", windows: [{ name: "5h", used: 10, resetsAt: T0.toISOString() }] }),
+      mkAccount({ id: "no-win", windows: [] }),
+    ],
+  });
+  expect(accountHasWindows("p", "with-win", [provider])).toBe(true);
+  expect(accountHasWindows("p", "no-win", [provider])).toBe(false);
+  // 空账号（自动）永远不能跟窗口
+  expect(accountHasWindows("p", "", [provider])).toBe(false);
+  // 旧任务里存着、目录里已经没有的账号
+  expect(accountHasWindows("p", "gone", [provider])).toBe(false);
+  expect(accountHasWindows("nope", "with-win", [provider])).toBe(false);
 });

@@ -45,6 +45,12 @@ const MODEL_SOURCE_HINT =
   "模型列表来自 Magpie 上次获取的结果。账号和模型对不上时，到 Magpie「供应商」里打开这个供应商，点「获取模型」，再回来刷新本页。";
 /** 提示 B：整个供应商还没有模型列表（替代提示 A，此时模型下拉禁用） */
 const NO_MODELS_HINT = "还没有这个供应商的模型列表。请到 Magpie「供应商」里打开它，点「获取模型」。";
+/** 三种触发；「窗口重置后」只在所选账号确实有窗口时才出现（账号没有窗口时建了也必然失败） */
+const TRIGGERS = [
+  ["window", "窗口重置后"],
+  ["daily", "每天定时"],
+  ["every", "固定间隔"],
+] as const;
 
 // ---------- 纯函数 ----------
 
@@ -243,6 +249,17 @@ function windowAux(w: QuotaWindow): string {
 }
 
 /** 窗口下拉：所选账号的额度窗口；没账号 / 没窗口给占位，目录暂缺的已存窗口名保留原值 */
+/** 这个账号有没有可跟随的窗口（不限额的 Limit 已在服务端剔除）；没有就不提供「窗口重置后」 */
+export function accountHasWindows(
+  providerId: string,
+  accountId: string,
+  providers: CatalogProvider[],
+): boolean {
+  if (!accountId) return false;
+  const acct = providers.find((p) => p.id === providerId)?.accounts.find((a) => a.id === accountId);
+  return (acct?.windows.length ?? 0) > 0;
+}
+
 export function windowOptions(
   providerId: string,
   accountId: string,
@@ -928,6 +945,13 @@ function buildEditor(): HTMLElement {
   const providers = catalog?.providers ?? [];
   const provider = providers.find((p) => p.id === d.provider);
   const ed = el("div", "editor");
+  // 所选账号没有可跟随的窗口时，不再提供「窗口重置后」；已存任务若正用着它，
+  // 这次打开就落到每天定时（需要点保存才写入，取消即还原），免得留一个必然失败的任务
+  let droppedWindow = false;
+  if (d.trigger.kind === "window" && !accountHasWindows(d.provider, d.account, providers)) {
+    d.trigger = { kind: "daily", time: "06:00", timeZone: localTZ() };
+    droppedWindow = true;
+  }
 
   // 上次失败红字（只看已保存任务自己的记录）
   const saved = currentSavedTask();
@@ -1011,9 +1035,11 @@ function buildEditor(): HTMLElement {
   }
   row(ed, "发送到", ...parts);
 
-  // 触发：三选一分段控件 + 各自的字段行
+  // 触发：按所选账号有没有窗口决定是否给「窗口重置后」，其余两档始终可用
+  const hasWindows = accountHasWindows(d.provider, d.account, providers);
   const seg = el("div", "seg");
-  for (const [k, txt] of [["window", "窗口重置后"], ["daily", "每天定时"], ["every", "固定间隔"]] as const) {
+  for (const [k, txt] of TRIGGERS) {
+    if (k === "window" && !hasWindows) continue;
     const b = el("button", d.trigger.kind === k ? "on" : "", txt) as HTMLButtonElement;
     b.type = "button";
     b.addEventListener("click", () => {
@@ -1114,6 +1140,9 @@ function buildEditor(): HTMLElement {
       dates.push(...nextPointsAfter(d.trigger, now, 3));
     }
     nextEl.append("接下来 ", el("b", undefined, dates.length ? dates.map((x) => nextLabel(x.toISOString(), now)).join(" · ") : "—"));
+  }
+  if (droppedWindow) {
+    nextEl.prepend(el("div", "hint mute", "这个账号没有可跟随的窗口，已改为每天定时，保存后生效。"));
   }
   row(ed, "触发", seg, line, nextEl);
 
