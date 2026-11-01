@@ -6,15 +6,11 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { gatewayBase } from "./gateway";
-import { startService, type ServiceHandle } from "./server";
+import { alreadyServing, startService, type ServiceHandle } from "./server";
 import { migrateLegacyState } from "./store";
 
 /** 默认服务端口，与 package.json 的 magpie.options 和带路页（page/boot.js）一致 */
 export const DEFAULT_PORT = 3492;
-/** 启动前探测已有实例的超时：挂着不响应的服务按「不是本插件」处理 */
-const PROBE_TIMEOUT_MS = 2_000;
-/** 本插件服务的自标记响应头，与 server.ts 的 MARKER_HEADER 一致 */
-const MARKER_HEADER = "x-window-warmup";
 
 /** 数据目录：WINDOW_WARMUP_DIR 优先，否则 XDG 配置目录下的 magpie/window-warmup。
  * 不导出：宿主会把模块导出的每个函数都当插件函数调（scripts/check.mjs 的约定） */
@@ -23,17 +19,6 @@ function defaultDir(env: Record<string, string | undefined> = process.env): stri
   if (custom) return custom;
   const xdg = env.XDG_CONFIG_HOME?.trim();
   return join(xdg || join(homedir(), ".config"), "magpie", "window-warmup");
-}
-
-async function alreadyServing(port: number): Promise<boolean> {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/`, {
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-    });
-    return res.headers.get(MARKER_HEADER) === "1";
-  } catch {
-    return false; // 没人听或探测不通：按未运行处理
-  }
 }
 
 /** 端口 → 启动中的服务；按端口分键，端口改了旧实例也不串 */

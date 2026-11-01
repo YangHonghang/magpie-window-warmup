@@ -302,13 +302,22 @@ async function releaseLock(path: string): Promise<void> {
 
 export type LockResult = { ok: true; release: () => Promise<void> } | { ok: false; pid: number };
 
+export interface AcquireLockOptions {
+  /**
+   * 锁冲突且 pid 存活时的二次确认：持有者是否真的在服务。
+   * 容器/整机重启后 pid 会被无关进程复用，持久卷上的旧锁就成了假阳性——
+   * 只有确认不过的才当陈旧锁接管；不传则维持原行为（pid 活着就算被占）。
+   */
+  confirmAlive?: (pid: number) => Promise<boolean> | boolean;
+}
+
 /**
  * 原子排他创建 service.lock（写入本进程 pid）：
- * - 已存在且 pid 存活 → {ok:false, pid}
- * - 已存在且 pid 确认不存在 → 接管（删旧文件重抢）
+ * - 已存在且持有者确认在服务 → {ok:false, pid}
+ * - 已存在且 pid 确认不存在，或 pid 被复用但确认不过（持有者并未在服务）→ 接管（删旧文件重抢）
  * - 已存在但内容读不出/解析不了（活性不明）→ 不抢占，{ok:false, pid:0}
  */
-export async function acquireLock(dir: string): Promise<LockResult> {
+export async function acquireLock(dir: string, opts: AcquireLockOptions = {}): Promise<LockResult> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, LOCK_FILE);
   // 上一次持有者在 writeFile 与 link 之间崩溃会留下 *.tmp 残骸，永不自清；入口顺带扫掉
@@ -341,7 +350,11 @@ export async function acquireLock(dir: string): Promise<LockResult> {
     }
     const pid = parsePid(raw);
     if (pid === null) return { ok: false, pid: 0 };
-    if (pidAlive(pid)) return { ok: false, pid };
+    if (pidAlive(pid)) {
+      const confirmed = opts.confirmAlive ? await opts.confirmAlive(pid) : true;
+      if (confirmed) return { ok: false, pid };
+      // pid 被复用而持有者并未在服务：不认这把锁，落到下面的接管路径
+    }
     try {
       await unlink(path);
     } catch {

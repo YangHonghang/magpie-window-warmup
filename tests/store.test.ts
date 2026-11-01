@@ -232,6 +232,39 @@ describe("acquireLock", () => {
     expect(await readFile(join(dir, "service.lock"), "utf8")).toBe(String(process.pid));
   });
 
+  test("锁里是存活 pid 但确认不过（持有者并未在服务）→ 视为陈旧锁接管", async () => {
+    const dir = await newDir();
+    await writeFile(join(dir, "service.lock"), String(process.pid));
+    const lock = await acquireLock(dir, { confirmAlive: () => false });
+    expect(lock.ok).toBe(true);
+    expect(await readFile(join(dir, "service.lock"), "utf8")).toBe(String(process.pid));
+    if (lock.ok) await lock.release();
+  });
+
+  test("锁里是存活 pid 且确认在服务 → ok:false 不覆盖文件", async () => {
+    const dir = await newDir();
+    await writeFile(join(dir, "service.lock"), String(process.pid));
+    const lock = await acquireLock(dir, { confirmAlive: () => true });
+    expect(lock.ok).toBe(false);
+    if (!lock.ok) expect(lock.pid).toBe(process.pid);
+    expect(await readFile(join(dir, "service.lock"), "utf8")).toBe(String(process.pid));
+  });
+
+  test("pid 已死时不调用确认直接接管", async () => {
+    const dir = await newDir();
+    await writeFile(join(dir, "service.lock"), String(2 ** 22 + 1));
+    let calls = 0;
+    const lock = await acquireLock(dir, {
+      confirmAlive: () => {
+        calls += 1;
+        return true;
+      },
+    });
+    expect(lock.ok).toBe(true);
+    expect(calls).toBe(0);
+    if (lock.ok) await lock.release();
+  });
+
   test("锁里是不存在的 pid → 接管并写入自身 pid", async () => {
     const dir = await newDir();
     await writeFile(join(dir, "service.lock"), String(2 ** 22 + 1));

@@ -1740,7 +1740,7 @@ async function releaseLock(path) {
   if (parsePid(raw) === process.pid)
     await unlink(path).catch(() => {});
 }
-async function acquireLock(dir) {
+async function acquireLock(dir, opts = {}) {
   await mkdir(dir, { recursive: true, mode: 448 });
   const path = join2(dir, LOCK_FILE);
   const leftovers = await readdir(dir).catch(() => []);
@@ -1773,8 +1773,11 @@ async function acquireLock(dir) {
     const pid = parsePid(raw);
     if (pid === null)
       return { ok: false, pid: 0 };
-    if (pidAlive(pid))
-      return { ok: false, pid };
+    if (pidAlive(pid)) {
+      const confirmed = opts.confirmAlive ? await opts.confirmAlive(pid) : true;
+      if (confirmed)
+        return { ok: false, pid };
+    }
     try {
       await unlink(path);
     } catch {}
@@ -1785,7 +1788,18 @@ async function acquireLock(dir) {
 // src/server.ts
 var TOKEN_HEADER = "x-window-warmup-token";
 var MARKER_HEADER = "x-window-warmup";
+var PROBE_TIMEOUT_MS = 2000;
 var BODY_LIMIT = 64 * 1024;
+async function alreadyServing(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+    });
+    return res.headers.get(MARKER_HEADER) === "1";
+  } catch {
+    return false;
+  }
+}
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -1845,7 +1859,9 @@ async function startService(opts) {
   let lockRelease = null;
   let lockedBy = null;
   if (!fatal && store) {
-    const lock = await acquireLock(opts.dir);
+    const lock = await acquireLock(opts.dir, {
+      confirmAlive: opts.confirmLockAlive ?? (() => alreadyServing(opts.port))
+    });
     if (lock.ok)
       lockRelease = lock.release;
     else
@@ -2083,24 +2099,12 @@ async function startService(opts) {
 
 // src/plugin.ts
 var DEFAULT_PORT = 3492;
-var PROBE_TIMEOUT_MS = 2000;
-var MARKER_HEADER2 = "x-window-warmup";
 function defaultDir(env = process.env) {
   const custom = env.WINDOW_WARMUP_DIR?.trim();
   if (custom)
     return custom;
   const xdg = env.XDG_CONFIG_HOME?.trim();
   return join4(xdg || join4(homedir3(), ".config"), "magpie", "window-warmup");
-}
-async function alreadyServing(port) {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/`, {
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
-    });
-    return res.headers.get(MARKER_HEADER2) === "1";
-  } catch {
-    return false;
-  }
 }
 var instances = new Map;
 var plugin_default = {

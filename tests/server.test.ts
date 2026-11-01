@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join, posix, win32 } from "node:path";
 import plugin from "../src/plugin";
 import { buildAll } from "../scripts/build";
-import { insideDir, startService, type ServiceHandle } from "../src/server";
+import { alreadyServing, insideDir, startService, type ServiceHandle } from "../src/server";
 import { fakeGateway, type FakeGateway } from "./fake-gateway";
 
 beforeAll(async () => {
@@ -34,14 +34,25 @@ interface Harness {
   api: (path: string, init?: RequestInit) => Promise<Response>;
 }
 
-async function harness(opts: { state?: string; lockPid?: number } = {}): Promise<Harness> {
+async function harness(
+  opts: {
+    state?: string;
+    lockPid?: number;
+    confirmLockAlive?: (pid: number) => Promise<boolean>;
+  } = {},
+): Promise<Harness> {
   const gw = fakeGateway({ models: MODELS });
   gateways.push(gw);
   const dir = await mkdtemp(join(tmpdir(), "sm-server-test-"));
   dirs.push(dir);
   if (opts.state !== undefined) await writeFile(join(dir, "state.json"), opts.state);
   if (opts.lockPid !== undefined) await writeFile(join(dir, "service.lock"), String(opts.lockPid));
-  const svc = await startService({ port: 0, dir, base: gw.base });
+  const svc = await startService({
+    port: 0,
+    dir,
+    base: gw.base,
+    confirmLockAlive: opts.confirmLockAlive,
+  });
   services.push(svc);
   const base = `http://127.0.0.1:${svc.port}`;
   const html = await (await fetch(base)).text();
@@ -318,8 +329,8 @@ test("不认识的版本号同样 fatal", async () => {
   expect(state.fatal).toContain("版本");
 });
 
-test("锁被占 → /api/state 返回 lockedBy，不启动调度", async () => {
-  const { api } = await harness({ lockPid: process.pid });
+test("锁被占（持有者确认在服务）→ /api/state 返回 lockedBy，不启动调度", async () => {
+  const { api } = await harness({ lockPid: process.pid, confirmLockAlive: async () => true });
   const state = (await (await api("/api/state")).json()) as {
     lockedBy?: number;
     fatal?: string;
@@ -331,6 +342,32 @@ test("锁被占 → /api/state 返回 lockedBy，不启动调度", async () => {
   expect((await api("/api/tasks", { method: "POST", body: JSON.stringify(DAILY) })).status).toBe(
     503,
   );
+});
+
+test("锁被占但持有者并未在服务（pid 被复用）→ 接管陈旧锁，正常读写", async () => {
+  // Docker 上容器重建后 pid 会被无关进程（比如 magpie 自己）复用，卷上的旧锁是假阳性；
+  // 缺省确认走端口探测，port 0 必然无人应答 → 必须接管而不是只读
+  const h = await harness({ lockPid: process.pid });
+  const state = (await (await h.api("/api/state")).json()) as { lockedBy?: number };
+  expect(state.lockedBy ?? null).toBeNull();
+  const res = await h.api("/api/tasks", { method: "POST", body: JSON.stringify(DAILY) });
+  expect(res.status).toBe(200);
+});
+
+test("alreadyServing 只认带本插件标记头的响应", async () => {
+  const marker = Bun.serve({
+    port: 0,
+    fetch: () => new Response("x", { headers: { "x-window-warmup": "1" } }),
+  });
+  const plain = Bun.serve({ port: 0, fetch: () => new Response("x") });
+  try {
+    expect(await alreadyServing(marker.port ?? 0)).toBe(true);
+    expect(await alreadyServing(plain.port ?? 0)).toBe(false);
+  } finally {
+    marker.stop(true);
+    plain.stop(true);
+  }
+  expect(await alreadyServing(0)).toBe(false); // 没人听：按未运行处理
 });
 
 test("GET /api/catalog 走网关并透传目录", async () => {

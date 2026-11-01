@@ -14,10 +14,27 @@ import { acquireLock, openStore, StoreError, type Store } from "./store";
 
 /** 页面请求 /api/* 用的口令头 */
 export const TOKEN_HEADER = "x-window-warmup-token";
-/** 本插件服务的自标记响应头：所有响应都带，plugin.ts 靠它识别已有实例 */
-const MARKER_HEADER = "x-window-warmup";
+/** 本插件服务的自标记响应头：所有响应都带，识别「这是窗口预热的服务」 */
+export const MARKER_HEADER = "x-window-warmup";
+/** 启动前探测已有实例的超时：挂着不响应的服务按「不是本插件」处理 */
+const PROBE_TIMEOUT_MS = 2_000;
 /** JSON 请求体上限：任务字段都很小，超限必然不是页面发的 */
 const BODY_LIMIT = 64 * 1024;
+
+/**
+ * 探测端口上有没有本插件的服务在应答（所有响应都带 MARKER_HEADER）。
+ * plugin.ts 启动前用它识别「已经在跑」；锁冲突时用它确认持有者是否真在服务。
+ */
+export async function alreadyServing(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    return res.headers.get(MARKER_HEADER) === "1";
+  } catch {
+    return false; // 没人听或探测不通：按未运行处理
+  }
+}
 
 export interface ServiceOptions {
   /** 监听端口；0 = 让系统挑空闲端口（测试用） */
@@ -28,6 +45,8 @@ export interface ServiceOptions {
   base: string;
   /** 界面静态文件目录；缺省按运行位置解析（源码态 ../dist/ui，构建产物态 ./ui） */
   uiDir?: string;
+  /** 锁冲突时的持有者确认，仅测试注入；缺省探测本服务端口上有无本插件在应答 */
+  confirmLockAlive?: (pid: number) => Promise<boolean>;
 }
 
 export interface ServiceHandle {
@@ -108,7 +127,12 @@ export async function startService(opts: ServiceOptions): Promise<ServiceHandle>
   let lockRelease: (() => Promise<void>) | null = null;
   let lockedBy: number | null = null;
   if (!fatal && store) {
-    const lock = await acquireLock(opts.dir);
+    const lock = await acquireLock(opts.dir, {
+      // pid 活 ≠ 持有者真在跑：容器/整机重启后 pid 常被无关进程复用（比如 magpie 自己），
+      // 持久卷上的旧锁就成了假阳性，服务会错误进入只读、调度停摆。持有者必须
+      // 真的在应答本插件的标记头才认，否则按陈旧锁接管。
+      confirmAlive: opts.confirmLockAlive ?? (() => alreadyServing(opts.port)),
+    });
     if (lock.ok) lockRelease = lock.release;
     else lockedBy = lock.pid; // pid 0 = 持有者身份无法判断
   }
