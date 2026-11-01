@@ -1122,7 +1122,7 @@ class Scheduler {
   }
   snapshotTask(task, now, next, points) {
     if (task.trigger.kind === "window") {
-      const info = this.windowInfo(task);
+      const info = this.windowInfo(task, now);
       let at = null;
       if (info && !("error" in info)) {
         const tried = this.marksOf(task.id).resetKeys.includes(info.resetKey);
@@ -1241,7 +1241,7 @@ class Scheduler {
   }
   async evaluateWindow(task, now) {
     const marks = this.marksOf(task.id);
-    const info = this.windowInfo(task);
+    const info = this.windowInfo(task, now);
     if (!info || "error" in info)
       return;
     if (info.at.getTime() > now.getTime())
@@ -1255,7 +1255,7 @@ class Scheduler {
     this.quotaStale = true;
     await this.fire(task, info.at, "schedule", info.resetKey);
   }
-  windowInfo(task) {
+  windowInfo(task, now) {
     if (task.trigger.kind !== "window")
       return null;
     const snap = this.quota;
@@ -1272,9 +1272,22 @@ class Scheduler {
     if ("error" in due)
       return { at: snap.at, error: due.error };
     const raw = win?.resetsAt;
-    if (raw && !Number.isNaN(new Date(raw).getTime()) && due.resetKey.startsWith("idle:")) {
-      return { at: due.at, resetKey: raw };
+    if (raw && !Number.isNaN(new Date(raw).getTime())) {
+      const mark = this.marksOf(task.id);
+      if (mark.lastReset !== raw) {
+        mark.lastReset = raw;
+        this.trackSave();
+      }
+      if (due.resetKey.startsWith("idle:")) {
+        return { at: due.at, resetKey: raw };
+      }
+      return due;
     }
+    const mark = this.marksOf(task.id);
+    const last = mark.lastReset;
+    const seenFuture = (last ? new Date(last).getTime() : NaN) > now.getTime() || mark.resetKeys.some((k) => !k.startsWith("idle:") && !k.startsWith("missing:") && !Number.isNaN(new Date(k).getTime()) && new Date(k).getTime() > now.getTime());
+    if (seenFuture)
+      return null;
     return due;
   }
   snapshotFresh(now) {
@@ -1440,7 +1453,7 @@ class Scheduler {
       if (!task.enabled)
         continue;
       if (task.trigger.kind === "window") {
-        const info = this.windowInfo(task);
+        const info = this.windowInfo(task, now);
         if (info && !("error" in info) && info.at.getTime() > now.getTime()) {
           minDelay = Math.min(minDelay, info.at.getTime() - now.getTime());
         } else if (info && !("error" in info) && info.at.getTime() <= now.getTime() && !this.marksOf(task.id).resetKeys.includes(info.resetKey) && this.snapshotFresh(now)) {

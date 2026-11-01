@@ -938,3 +938,37 @@ test("key 目录比额度快照后到 → 首轮不误报「额度里没有账�
   expect(h.sendCalls).toHaveLength(1);
   expect(h.sendCalls[0].pin).toBeNull(); // 目录里只有 1 把 key：不发头
 });
+
+test("window：窗口在计时但额度卡瞬断丢了 resetsAt → 不当空闲重发", async () => {
+  // 插件供应商的用量读取时好时坏：同一扇正在计时的窗口，这一轮读出来没有 resetsAt，
+  // 看起来像空闲。0.2.2 之前会按「空闲立即发」重发一次；记住最近见过的重置时间后能分清
+  let resetsAt: string | null = new Date(ms(T0) + 11 * HOUR).toISOString(); // 未来
+  const h = await harness({
+    quotas: () => ({
+      entries: [{
+        provider: "openai", account: "acct-yang", label: "Y", viaKey: false,
+        windows: [{ name: "5h", used: 1, resetsAt }],
+      }],
+    }),
+  });
+  const id = (await h.scheduler.upsert(dailyTask({
+    name: "开窗", trigger: { kind: "window", window: "5h" }, account: "acct-yang",
+  }))).id;
+  h.scheduler.start();
+  h.fireDue(); // 读到未来 resetsAt → 记下并排程到 R+30s
+  await h.flush();
+  expect(h.sendCalls).toHaveLength(0);
+
+  resetsAt = null; // 卡瞬断
+  h.advance(10 * 60_000);
+  h.fireDue();
+  await h.flush();
+  expect(h.sendCalls).toHaveLength(0); // 不当空闲发送
+
+  resetsAt = new Date(ms(T0) + 11 * HOUR).toISOString(); // 卡恢复
+  h.advance(10 * 60_000);
+  h.fireDue();
+  await h.flush();
+  expect(h.sendCalls).toHaveLength(0);
+  expect(h.scheduler.snapshot().next[id]).toBe(new Date(ms(T0) + 11 * HOUR + 30_000).toISOString());
+});

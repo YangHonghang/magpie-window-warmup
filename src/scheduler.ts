@@ -293,7 +293,7 @@ export class Scheduler {
     points: TimelinePoint[],
   ): void {
     if (task.trigger.kind === "window") {
-      const info = this.windowInfo(task);
+      const info = this.windowInfo(task, now);
       let at: Date | null = null;
       if (info && !("error" in info)) {
         const tried = this.marksOf(task.id).resetKeys.includes(info.resetKey);
@@ -439,7 +439,7 @@ export class Scheduler {
 
   private async evaluateWindow(task: Task, now: Date): Promise<void> {
     const marks = this.marksOf(task.id);
-    const info = this.windowInfo(task);
+    const info = this.windowInfo(task, now);
     // 拿不到窗口不记失败：额度卡时有时无（插件供应商的用量读取会瞬断、刚刷新时缓存
     // 短暂缺卡），按失败上报只会刷一屏红字。等下一轮刷新，页面上的账号/窗口下拉会
     // 显示当前实际有哪些；账号或窗口被永久删掉时，编辑区能看出来
@@ -456,7 +456,7 @@ export class Scheduler {
   }
 
   /** 用当前快照判断窗口任务的到期点；null 表示拿不到（无快照） */
-  private windowInfo(task: Task): WindowInfo | null {
+  private windowInfo(task: Task, now: Date): WindowInfo | null {
     if (task.trigger.kind !== "window") return null;
     const snap = this.quota;
     if (!snap) return null;
@@ -469,14 +469,37 @@ export class Scheduler {
     const win = windows.find((w) => w.name === windowName);
     const due = windowDue(win, snap.at);
     if ("error" in due) return { at: snap.at, error: due.error };
-    // windowDue 对「resetsAt 已过」也回 idle:小时取整——同一份旧重置每小时会换个新 key，
-    // 会被误当成新的空闲事件反复发送。只要窗口带着可解析的 resetsAt，key 就用 resetsAt 本身：
-    // 与重置发送同 key，消费过就绝不再发（刷新/跨小时/重启都一样），出现新 resetsAt 才是新事件；
-    // truthy 但解析不了的 resetsAt 当缺失处理，保留按小时限频。
     const raw = win?.resetsAt;
-    if (raw && !Number.isNaN(new Date(raw).getTime()) && due.resetKey.startsWith("idle:")) {
-      return { at: due.at, resetKey: raw };
+    if (raw && !Number.isNaN(new Date(raw).getTime())) {
+      // 记下最近见到的重置时间（变了才落盘）：额度卡瞬断丢了 resetsAt 时靠它分辨真假空闲
+      const mark = this.marksOf(task.id);
+      if (mark.lastReset !== raw) {
+        mark.lastReset = raw;
+        void this.trackSave();
+      }
+      // 只要窗口带着可解析的 resetsAt，key 就用 resetsAt 本身：与重置发送同 key，消费过
+      // 就绝不再发（刷新/跨小时/重启都一样），出现新 resetsAt 才是新事件；
+      // truthy 但解析不了的 resetsAt 当缺失处理，保留按小时限频。
+      if (due.resetKey.startsWith("idle:")) {
+        return { at: due.at, resetKey: raw };
+      }
+      return due;
     }
+    // resetsAt 缺失或解析不了——两种可能：真空闲（没开始/上一轮已过），或卡瞬断。
+    // 之前见过且还没到的重置时间说明窗口其实在计时，这轮当没数据，静默等下一轮刷新；
+    // 已消费过的未来 resetsAt 同理（重启后 lastReset 还没补上时兜一道）。
+    const mark = this.marksOf(task.id);
+    const last = mark.lastReset;
+    const seenFuture =
+      (last ? new Date(last).getTime() : NaN) > now.getTime() ||
+      mark.resetKeys.some(
+        (k) =>
+          !k.startsWith("idle:") &&
+          !k.startsWith("missing:") &&
+          !Number.isNaN(new Date(k).getTime()) &&
+          new Date(k).getTime() > now.getTime(),
+      );
+    if (seenFuture) return null;
     return due;
   }
 
@@ -696,7 +719,7 @@ export class Scheduler {
     for (const task of this.store.data.tasks) {
       if (!task.enabled) continue;
       if (task.trigger.kind === "window") {
-        const info = this.windowInfo(task);
+        const info = this.windowInfo(task, now);
         if (info && !("error" in info) && info.at.getTime() > now.getTime()) {
           minDelay = Math.min(minDelay, info.at.getTime() - now.getTime());
         } else if (

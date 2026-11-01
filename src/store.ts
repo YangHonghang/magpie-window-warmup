@@ -29,6 +29,9 @@ export interface TaskMarks {
   lastDue: string | null;
   /** 已尝试过的窗口 resetKey（成功/失败/未知都算），最多留最近 20 个 */
   resetKeys: string[];
+  /** 这个任务的窗口最近一次见到的重置时间（ISO）：额度卡瞬断丢了 resetsAt 时，
+   * 用它区分「窗口其实在计时」和「真空闲」；旧数据没有这个字段照常加载 */
+  lastReset?: string | null;
 }
 
 export interface StateFile {
