@@ -196,7 +196,7 @@ describe("validateTask", () => {
   const base = {
     name: "早报",
     provider: "openai",
-    account: "",
+    account: "acc-1",
     model: "gpt-5",
     trigger: { kind: "daily", time: "06:00", timeZone: SH },
   };
@@ -211,14 +211,9 @@ describe("validateTask", () => {
     }
   });
 
-  test("窗口任务 account 为空（不允许自动选账号）→ field account", () => {
-    const r = validateTask({ ...base, account: "", trigger: { kind: "window", window: "5h" } }, now);
+  test("account 为空（账号必选，不分触发）→ field account", () => {
+    const r = validateTask({ ...base, account: "" }, now);
     expect("error" in r && r.field === "account").toBe(true);
-  });
-
-  test("窗口任务 account 非空 → 通过", () => {
-    const r = validateTask({ ...base, account: "acc-1", trigger: { kind: "window", window: "5h" } }, now);
-    expect("task" in r).toBe(true);
   });
 
   test("名称为空 → field name", () => {

@@ -64,7 +64,7 @@ async function harness(opts: { state?: string; lockPid?: number } = {}): Promise
 const DAILY = {
   name: "早报",
   provider: "p1",
-  account: "",
+  account: "acct-1",
   model: "p1/m1",
   message: "hi",
   trigger: { kind: "daily", time: "06:00", timeZone: "Asia/Shanghai" },

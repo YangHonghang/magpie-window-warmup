@@ -884,6 +884,8 @@ function validateTask(input, now) {
       return { error: "\u8D26\u53F7\u6807\u8BC6\u5FC5\u987B\u662F\u6587\u672C", field: "account" };
     account = raw.account.trim();
   }
+  if (!account)
+    return { error: "\u5FC5\u987B\u9009\u62E9\u8D26\u53F7", field: "account" };
   const trig = raw.trigger;
   if (typeof trig !== "object" || trig === null || Array.isArray(trig)) {
     return { error: "\u7F3A\u5C11\u89E6\u53D1\u65B9\u5F0F", field: "trigger" };
@@ -895,8 +897,6 @@ function validateTask(input, now) {
       const win = typeof tv.window === "string" ? tv.window.trim() : "";
       if (!win)
         return { error: "\u5FC5\u987B\u586B\u5199\u989D\u5EA6\u7A97\u53E3\u540D", field: "window" };
-      if (!account)
-        return { error: "\u7A97\u53E3\u4EFB\u52A1\u5FC5\u987B\u6307\u5B9A\u8D26\u53F7\uFF0C\u4E0D\u652F\u6301\u81EA\u52A8\u9009\u62E9", field: "account" };
       trigger = { kind: "window", window: win };
       break;
     }
@@ -1242,16 +1242,8 @@ class Scheduler {
   async evaluateWindow(task, now) {
     const marks = this.marksOf(task.id);
     const info = this.windowInfo(task);
-    if (!info)
+    if (!info || "error" in info)
       return;
-    if ("error" in info) {
-      const key = `missing:${hourFloorISO(info.at)}`;
-      if (marks.resetKeys.includes(key))
-        return;
-      marks.resetKeys.push(key);
-      this.appendFailure(task, this.nowFn(), null, info.error, key, "schedule");
-      return;
-    }
     if (info.at.getTime() > now.getTime())
       return;
     if (marks.resetKeys.includes(info.resetKey))

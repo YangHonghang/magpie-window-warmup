@@ -120,13 +120,11 @@ function runReason(r) {
   parts.push(SOURCE_TEXT[r.source] ?? r.source);
   return parts.join(" · ");
 }
-function accountOptions(providerId, current, allowAuto, providers) {
+function accountOptions(providerId, current, providers) {
   const list = [];
-  if (allowAuto)
-    list.push({ value: "", text: "自动（由 Magpie 选）" });
   const provider = providers.find((p) => p.id === providerId);
-  if (current && !provider?.accounts.some((a) => a.id === current)) {
-    list.push({ value: current, text: `${current}（不在当前账号列表）` });
+  if (!current || !provider?.accounts.some((a) => a.id === current)) {
+    list.push({ value: current, text: current ? `${current}（不在当前账号列表）` : "请选择账号" });
   }
   for (const a of provider?.accounts ?? []) {
     if (a.kind === "key" && a.label && a.label !== a.id)
@@ -230,9 +228,9 @@ function validateDraft(d) {
     return { error: `名称不能超过 ${NAME_MAX} 字`, field: "name" };
   if (!d.provider.trim())
     return { error: "必须选择供应商", field: "provider" };
+  if (!d.account.trim())
+    return { error: "必须选择账号", field: "account" };
   if (d.trigger.kind === "window") {
-    if (!d.account.trim())
-      return { error: "窗口任务必须指定账号，不支持自动选择", field: "account" };
     if (!d.trigger.window)
       return { error: "必须填写额度窗口名", field: "window" };
   }
@@ -820,8 +818,7 @@ function buildEditor() {
     if (draft.model && !accountModelView(provider, v).models?.includes(draft.model))
       draft.model = "";
   };
-  const allowAuto = d.trigger.kind !== "window";
-  fs.append(sel("账号", accountOptions(d.provider, d.account, allowAuto, providers), d.account, (v) => {
+  fs.append(sel("账号", accountOptions(d.provider, d.account, providers), d.account, (v) => {
     markDirty();
     adoptAccount(v);
     if (draft && draft.trigger.kind === "window") {

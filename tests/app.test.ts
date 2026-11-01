@@ -218,7 +218,7 @@ test("nextLabel：今天 HH:MM / 明天 / M/D（取 UTC 与 +08 同日期的时�
   expect(nextLabel("2026-11-05T06:00:00Z", T0)).toMatch(/^11\/5 \d{2}:\d{2}$/);
 });
 
-test("accountOptions：自动项；key 账号 label + 指纹附注；旧账号保留并标注", () => {
+test("accountOptions：账号必选（无自动项）；key 账号 label + 指纹附注；旧账号保留并标注", () => {
   const providers = [
     mkProvider({
       id: "remote-magpie",
@@ -229,18 +229,16 @@ test("accountOptions：自动项；key 账号 label + 指纹附注；旧账号�
       ],
     }),
   ];
-  const withAuto = accountOptions("remote-magpie", "", true, providers);
-  expect(withAuto[0]).toEqual({ value: "", text: "自动（由 Magpie 选）" });
-  expect(withAuto[1]).toEqual({ value: "acct-team", text: "acct-team" });
-  expect(withAuto[2]).toEqual({ value: FP1, text: "主 Key", aux: FP1 });
-  expect(withAuto[3]).toEqual({ value: FP2, text: FP2 });
-
-  const noAuto = accountOptions("remote-magpie", "", false, providers);
-  expect(noAuto.some((o) => o.value === "")).toBe(false);
-  expect(noAuto[0].value).toBe("acct-team");
+  const opts = accountOptions("remote-magpie", "", providers);
+  // 账号必选：空账号只给「请选择账号」占位，不再有自动项
+  expect(opts[0]).toEqual({ value: "", text: "请选择账号" });
+  expect(opts[1]).toEqual({ value: "acct-team", text: "acct-team" });
+  expect(opts[2]).toEqual({ value: FP1, text: "主 Key", aux: FP1 });
+  expect(opts[3]).toEqual({ value: FP2, text: FP2 });
+  expect(opts.some((o) => o.text.includes("自动"))).toBe(false);
 
   // 旧任务里的账号（key 名或已删除的账号）不在目录：保留原值不自动改写，标注「不在当前账号列表」
-  const stale = accountOptions("remote-magpie", "sk-legacy", false, providers);
+  const stale = accountOptions("remote-magpie", "sk-legacy", providers);
   expect(stale[0]).toEqual({ value: "sk-legacy", text: "sk-legacy（不在当前账号列表）" });
 });
 
@@ -464,17 +462,21 @@ test("validateDraft：名称 / 供应商 / 窗口账号与窗口名必填", () =
     error: "必须选择供应商",
     field: "provider",
   });
+  // 账号必选，不分触发方式
+  expect(validateDraft(mkTask({ account: "" }))).toEqual({ error: "必须选择账号", field: "account" });
   expect(
     validateDraft(mkTask({ trigger: { kind: "window", window: "5h" }, account: "" })),
-  ).toEqual({ error: "窗口任务必须指定账号，不支持自动选择", field: "account" });
+  ).toEqual({ error: "必须选择账号", field: "account" });
   expect(
     validateDraft(mkTask({ trigger: { kind: "window", window: "" }, account: "a" })),
   ).toEqual({ error: "必须填写额度窗口名", field: "window" });
-  expect(validateDraft(mkTask({ trigger: { kind: "daily", time: "", timeZone: "UTC" } }))).toEqual({
+  expect(
+    validateDraft(mkTask({ account: "a", trigger: { kind: "daily", time: "", timeZone: "UTC" } })),
+  ).toEqual({
     error: "时间需为 24 小时制的 HH:MM",
     field: "time",
   });
-  expect(validateDraft(mkTask())).toBeNull();
+  expect(validateDraft(mkTask({ account: "a" }))).toBeNull();
 });
 
 test("accountHasWindows：没账号、不在目录、没有窗口都算没有——此时不提供「窗口重置后」", () => {

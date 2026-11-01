@@ -440,15 +440,10 @@ export class Scheduler {
   private async evaluateWindow(task: Task, now: Date): Promise<void> {
     const marks = this.marksOf(task.id);
     const info = this.windowInfo(task);
-    if (!info) return; // 没有快照（刷新一直失败）→ 等下轮
-    if ("error" in info) {
-      // 找不到账号/窗口：失败记一次，同一小时内不重复（key 按快照小时取整）
-      const key = `missing:${hourFloorISO(info.at)}`;
-      if (marks.resetKeys.includes(key)) return;
-      marks.resetKeys.push(key);
-      this.appendFailure(task, this.nowFn(), null, info.error, key, "schedule");
-      return;
-    }
+    // 拿不到窗口不记失败：额度卡时有时无（插件供应商的用量读取会瞬断、刚刷新时缓存
+    // 短暂缺卡），按失败上报只会刷一屏红字。等下一轮刷新，页面上的账号/窗口下拉会
+    // 显示当前实际有哪些；账号或窗口被永久删掉时，编辑区能看出来
+    if (!info || "error" in info) return;
     if (info.at.getTime() > now.getTime()) return; // 还没到 resetsAt+30s
     if (marks.resetKeys.includes(info.resetKey)) return; // 同一 resetKey 最多尝试一次
     marks.resetKeys.push(info.resetKey);

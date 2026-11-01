@@ -304,12 +304,13 @@ test("window：同一 resetKey 只发一次；空闲窗口同一小时不重试�
   expect(h.sendCalls).toHaveLength(2);
 });
 
-test("window：找不到窗口记一次失败，重复刷新不重复记录", async () => {
+test("window：账号在但窗口暂时不在 → 瞬态，不记失败，下一轮刷新继续等", async () => {
+  // 插件供应商的用量读取会瞬断（卡时有时无），按失败上报只会刷一屏红字
+  let windows = [{ name: "week", used: 1, resetsAt: null }]; // 没有 5h 窗口
   const h = await harness({
     quotas: () => ({
       entries: [{
-        provider: "openai", account: "acct-yang", label: "Y", viaKey: false,
-        windows: [{ name: "week", used: 1, resetsAt: null }], // 没有 5h 窗口
+        provider: "openai", account: "acct-yang", label: "Y", viaKey: false, windows,
       }],
     }),
   });
@@ -320,16 +321,20 @@ test("window：找不到窗口记一次失败，重复刷新不重复记录", as
   h.fireDue();
   await h.flush();
   expect(h.sendCalls).toHaveLength(0);
-  const failedRuns = () => h.store.data.runs.filter((r) => r.outcome !== "running");
-  expect(failedRuns()).toHaveLength(1);
-  expect(failedRuns()[0].outcome).toBe("failed");
-  expect(failedRuns()[0].reason).toBe("账号的额度里没有这个窗口");
-  expect(h.store.data.marks[h.store.data.tasks[0].id].resetKeys[0]).toMatch(/^missing:/);
+  expect(h.store.data.runs).toHaveLength(0); // 不记失败
 
   h.advance(10 * 60_000);
-  h.fireDue(); // 同一小时重复刷新 → 不重复记录
+  h.fireDue(); // 依旧没有 5h 窗口 → 仍不记失败、不发送
   await h.flush();
-  expect(failedRuns()).toHaveLength(1);
+  expect(h.sendCalls).toHaveLength(0);
+  expect(h.store.data.runs).toHaveLength(0);
+
+  // 额度里出现 5h 空闲窗口 → 正常开窗发送（快照新鲜 + 空闲 + 未发过 → 立即）
+  windows = [{ name: "5h", used: 0, resetsAt: null }];
+  h.advance(10 * 60_000);
+  h.fireDue();
+  await h.flush();
+  expect(h.sendCalls).toHaveLength(1);
 });
 
 test("window：resetsAt 在未来 → 到期点为 resetsAt+30s，按 resetsAt 去重", async () => {

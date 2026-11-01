@@ -276,6 +276,8 @@ export function validateTask(
     if (typeof raw.account !== "string") return { error: "账号标识必须是文本", field: "account" };
     account = raw.account.trim();
   }
+  // 账号必选：预热是发给具体账号/key 的，交给网关自动选就没有稳定的去重与窗口归属
+  if (!account) return { error: "必须选择账号", field: "account" };
 
   const trig = raw.trigger;
   if (typeof trig !== "object" || trig === null || Array.isArray(trig)) {
@@ -287,8 +289,6 @@ export function validateTask(
     case "window": {
       const win = typeof tv.window === "string" ? tv.window.trim() : "";
       if (!win) return { error: "必须填写额度窗口名", field: "window" };
-      // 窗口任务按 resetKey 去重，同一账号的窗口只试一次，自动选账号会让去重失真
-      if (!account) return { error: "窗口任务必须指定账号，不支持自动选择", field: "account" };
       trigger = { kind: "window", window: win };
       break;
     }

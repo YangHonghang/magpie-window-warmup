@@ -169,18 +169,17 @@ export function runReason(r: Run): string {
   return parts.join(" · ");
 }
 
-/** 账号下拉：来自目录；窗口触发（allowAuto=false）不给自动项；旧任务存的账号保留并标注 */
+/** 账号下拉：来自目录，必选（不给自动项）；旧任务存的账号保留并标注 */
 export function accountOptions(
   providerId: string,
   current: string,
-  allowAuto: boolean,
   providers: CatalogProvider[],
 ): SelOption[] {
   const list: SelOption[] = [];
-  if (allowAuto) list.push({ value: "", text: "自动（由 Magpie 选）" });
   const provider = providers.find((p) => p.id === providerId);
-  if (current && !provider?.accounts.some((a) => a.id === current)) {
-    list.push({ value: current, text: `${current}（不在当前账号列表）` });
+  if (!current || !provider?.accounts.some((a) => a.id === current)) {
+    // 空账号（旧任务遗留）或已失效的账号都保留一项，显示出来逼着改选，保存也会被拦下
+    list.push({ value: current, text: current ? `${current}（不在当前账号列表）` : "请选择账号" });
   }
   for (const a of provider?.accounts ?? []) {
     // 起了名的 key：名字做主文字、指纹做次要附注；没起名的（label 就是指纹）与订阅账号不重复
@@ -331,8 +330,8 @@ export function validateDraft(
   if (!name) return { error: "给任务起个名字", field: "name" };
   if ([...name].length > NAME_MAX) return { error: `名称不能超过 ${NAME_MAX} 字`, field: "name" };
   if (!d.provider.trim()) return { error: "必须选择供应商", field: "provider" };
+  if (!d.account.trim()) return { error: "必须选择账号", field: "account" };
   if (d.trigger.kind === "window") {
-    if (!d.account.trim()) return { error: "窗口任务必须指定账号，不支持自动选择", field: "account" };
     if (!d.trigger.window) return { error: "必须填写额度窗口名", field: "window" };
   }
   if (d.trigger.kind === "daily" && !/^([01]\d|2[0-3]):[0-5]\d$/.test(d.trigger.time)) {
@@ -1007,8 +1006,7 @@ function buildEditor(): HTMLElement {
     draft.account = v;
     if (draft.model && !accountModelView(provider, v).models?.includes(draft.model)) draft.model = "";
   };
-  const allowAuto = d.trigger.kind !== "window";
-  fs.append(sel("账号", accountOptions(d.provider, d.account, allowAuto, providers), d.account, (v) => {
+  fs.append(sel("账号", accountOptions(d.provider, d.account, providers), d.account, (v) => {
     markDirty();
     adoptAccount(v);
     if (draft && draft.trigger.kind === "window") {
