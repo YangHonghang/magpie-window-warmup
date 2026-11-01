@@ -191,7 +191,8 @@ function windowOptions(providerId, accountId, current, providers) {
   return list;
 }
 function forceWindowAccount(providerId, providers) {
-  return providers.find((p) => p.id === providerId)?.accounts[0]?.id ?? "";
+  const accounts = providers.find((p) => p.id === providerId)?.accounts ?? [];
+  return (accounts.find((a) => a.windows.length > 0) ?? accounts[0])?.id ?? "";
 }
 function modelHint(model, provider, accountId) {
   const autoSub = "名字带 flash / lite / mini 的小模型优先，每次发送前重新选；思考能关就关，不能关用最低档。";
@@ -782,6 +783,7 @@ function buildEditor() {
   if (formError)
     ed.append(el("div", "note full", formError));
   const name = el("input", "text");
+  name.dataset.fk = "name";
   name.value = d.name;
   name.maxLength = NAME_MAX;
   name.placeholder = "给任务起个名字";
@@ -801,7 +803,7 @@ function buildEditor() {
     if (!draft)
       return;
     draft.provider = v;
-    draft.account = draft.trigger.kind === "window" ? forceWindowAccount(v, providers) : "";
+    draft.account = forceWindowAccount(v, providers);
     if (draft.trigger.kind === "window") {
       draft.trigger = { kind: "window", window: windowOptions(v, draft.account, "", providers).find((o) => o.value)?.value ?? "" };
     }
@@ -889,6 +891,7 @@ function buildEditor() {
   } else if (d.trigger.kind === "daily") {
     const ti = el("input");
     ti.type = "time";
+    ti.dataset.fk = "daily-time";
     ti.value = d.trigger.time;
     ti.addEventListener("change", () => {
       markDirty();
@@ -918,6 +921,7 @@ function buildEditor() {
     }));
     const an = el("input");
     an.type = "datetime-local";
+    an.dataset.fk = "every-anchor";
     an.value = isoToLocalInput(d.trigger.anchor);
     an.addEventListener("change", () => {
       markDirty();
@@ -1095,6 +1099,7 @@ function renderList() {
   const list = document.getElementById("list");
   if (!list)
     return;
+  const focus = captureFocus(list);
   const tasks = state?.tasks ?? [];
   const confirming = deleteArmed(confirmDeleteAt, Date.now());
   const sig = JSON.stringify([
@@ -1137,6 +1142,32 @@ function renderList() {
       nodes.push(buildEditor());
     return nodes;
   });
+  restoreFocus(list, focus);
+}
+function captureFocus(root) {
+  const a = document.activeElement;
+  if (!(a instanceof HTMLInputElement) || !a.dataset.fk || !root.contains(a))
+    return null;
+  let start = null;
+  let end = null;
+  try {
+    start = a.selectionStart;
+    end = a.selectionEnd;
+  } catch {}
+  return { key: a.dataset.fk, start, end };
+}
+function restoreFocus(root, focus) {
+  if (!focus)
+    return;
+  const again = root.querySelector(`[data-fk="${focus.key}"]`);
+  if (!again)
+    return;
+  again.focus();
+  if (focus.start !== null && focus.end !== null) {
+    try {
+      again.setSelectionRange(focus.start, focus.end);
+    } catch {}
+  }
 }
 function renderSum() {
   const sum = document.getElementById("sum");

@@ -300,7 +300,9 @@ export class Scheduler {
         if (info.at.getTime() > now.getTime()) {
           at = tried ? null : info.at;
         } else if (!tried) {
-          at = new Date(now.getTime() + QUOTA_REFRESH_MS); // 空闲窗口：下次检查时刻
+          // 空闲窗口且本轮没发过：快照新鲜就立即发（调度器会在到点前先刷新快照），
+          // 快照过期/缺失才按刷新节奏等下一轮——保存即符合条件不该再等 10 分钟
+          at = this.snapshotFresh(now) ? now : new Date(now.getTime() + QUOTA_REFRESH_MS);
         }
       }
       next[task.id] = at ? at.toISOString() : null;
@@ -397,8 +399,9 @@ export class Scheduler {
     const now = this.nowFn();
     const tasks = this.store.data.tasks;
     const hasWindow = tasks.some((t) => t.enabled && t.trigger.kind === "window");
-    // 没有快照寸步难行：窗口任务存在但一条额度都没拿到过时先取一次
-    if (hasWindow && !this.quota) await this.refreshQuotas();
+    // 评估前先把快照刷到最新（refreshQuotas 对新鲜快照是空操作）：
+    // 拿过期快照评估会在睡眠醒来、手动发送刚开窗之后，按旧的空闲窗口再发一次
+    if (hasWindow) await this.refreshQuotas();
     for (const task of [...tasks]) {
       if (!task.enabled) continue;
       try {
@@ -482,12 +485,18 @@ export class Scheduler {
     return due;
   }
 
-  private async refreshQuotas(): Promise<void> {
-    const now = this.nowFn();
-    const quotaFresh =
+  /** 额度快照是否新鲜：没过期且不是上次发送刚弄脏的 */
+  private snapshotFresh(now: Date): boolean {
+    return (
       this.quota !== null &&
       !this.quotaStale &&
-      now.getTime() - this.quota.at.getTime() < QUOTA_REFRESH_MS;
+      now.getTime() - this.quota.at.getTime() < QUOTA_REFRESH_MS
+    );
+  }
+
+  private async refreshQuotas(): Promise<void> {
+    const now = this.nowFn();
+    const quotaFresh = this.snapshotFresh(now);
     // 快照还新鲜但 key 目录没读到（上轮失败）：也要再补读，指纹账号的窗口映射等着它
     if (quotaFresh && this.keyDirMap !== null) return;
     this.quotaTried = true;
@@ -695,8 +704,18 @@ export class Scheduler {
         const info = this.windowInfo(task);
         if (info && !("error" in info) && info.at.getTime() > now.getTime()) {
           minDelay = Math.min(minDelay, info.at.getTime() - now.getTime());
+        } else if (
+          info &&
+          !("error" in info) &&
+          info.at.getTime() <= now.getTime() &&
+          !this.marksOf(task.id).resetKeys.includes(info.resetKey) &&
+          this.snapshotFresh(now)
+        ) {
+          // 空闲窗口、本轮没发过、快照新鲜：立即唤醒去发（每小时最多一次，evaluateWindow 去重）。
+          // 快照过期时不走这条——先等一轮刷新，拿新数据再决定，免得按旧快照白发
+          minDelay = Math.min(minDelay, 0);
         } else {
-          // 没有可用的未来到期点：按刷新节奏回头再看（从未取到过快照时尽快取一次）
+          // 拿不到到期点（无快照/出错/刚发过）：按刷新节奏回头再看（从未取到过快照时尽快取一次）
           minDelay = Math.min(minDelay, this.quotaTried ? QUOTA_REFRESH_MS : 0);
         }
       } else {

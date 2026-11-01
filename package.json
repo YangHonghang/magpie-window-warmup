@@ -32,12 +32,14 @@
       "service": {
         "port": 3492,
         "option": "port"
-      }
+      },
+      "icon": "page/icon.svg"
     },
     "options": {
       "port": 3492
     },
-    "permissions": []
+    "permissions": [],
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMjggMTI4Ij4KICA8cmVjdCB3aWR0aD0iMTI4IiBoZWlnaHQ9IjEyOCIgcng9IjI4IiBmaWxsPSIjRTg4NjNDIi8+CiAgPHJlY3QgeD0iMzQiIHk9IjMwIiB3aWR0aD0iNjAiIGhlaWdodD0iNjQiIHJ4PSIxMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZmZmIiBzdHJva2Utd2lkdGg9IjciLz4KICA8cGF0aCBkPSJNNTIgNzhhMTIgMTIgMCAwIDEgMjQgMFoiIGZpbGw9IiNmZmYiLz4KICA8cGF0aCBkPSJNNDYgNzhoMzYiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSI3IiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8cGF0aCBkPSJNNjQgNTR2N000NyA2MWw1IDVNODEgNjFsLTUgNSIgc3Ryb2tlPSIjZmZmIiBzdHJva2Utd2lkdGg9IjYiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K"
   },
   "devDependencies": {
     "typescript": "5.9.3",

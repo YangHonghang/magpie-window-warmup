@@ -1129,7 +1129,7 @@ class Scheduler {
         if (info.at.getTime() > now.getTime()) {
           at = tried ? null : info.at;
         } else if (!tried) {
-          at = new Date(now.getTime() + QUOTA_REFRESH_MS);
+          at = this.snapshotFresh(now) ? now : new Date(now.getTime() + QUOTA_REFRESH_MS);
         }
       }
       next[task.id] = at ? at.toISOString() : null;
@@ -1203,7 +1203,7 @@ class Scheduler {
     const now = this.nowFn();
     const tasks = this.store.data.tasks;
     const hasWindow = tasks.some((t) => t.enabled && t.trigger.kind === "window");
-    if (hasWindow && !this.quota)
+    if (hasWindow)
       await this.refreshQuotas();
     for (const task of [...tasks]) {
       if (!task.enabled)
@@ -1285,9 +1285,12 @@ class Scheduler {
     }
     return due;
   }
+  snapshotFresh(now) {
+    return this.quota !== null && !this.quotaStale && now.getTime() - this.quota.at.getTime() < QUOTA_REFRESH_MS;
+  }
   async refreshQuotas() {
     const now = this.nowFn();
-    const quotaFresh = this.quota !== null && !this.quotaStale && now.getTime() - this.quota.at.getTime() < QUOTA_REFRESH_MS;
+    const quotaFresh = this.snapshotFresh(now);
     if (quotaFresh && this.keyDirMap !== null)
       return;
     this.quotaTried = true;
@@ -1448,6 +1451,8 @@ class Scheduler {
         const info = this.windowInfo(task);
         if (info && !("error" in info) && info.at.getTime() > now.getTime()) {
           minDelay = Math.min(minDelay, info.at.getTime() - now.getTime());
+        } else if (info && !("error" in info) && info.at.getTime() <= now.getTime() && !this.marksOf(task.id).resetKeys.includes(info.resetKey) && this.snapshotFresh(now)) {
+          minDelay = Math.min(minDelay, 0);
         } else {
           minDelay = Math.min(minDelay, this.quotaTried ? QUOTA_REFRESH_MS : 0);
         }

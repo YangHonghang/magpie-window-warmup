@@ -292,16 +292,16 @@ test("window：同一 resetKey 只发一次；空闲窗口同一小时不重试�
   await h.flush();
   expect(h.sendCalls).toHaveLength(1);
 
-  h.advance(HOUR); // 跨入下一个小时：快照换新 resetKey，但仍未重试
-  h.fireDue();
-  await h.flush();
-  expect(h.sendCalls).toHaveLength(1);
-
-  h.advance(11 * 60_000); // 用新快照再评估 → 新 resetKey → 可再试
+  h.advance(HOUR); // 跨入下一个小时：评估前先刷新 → 新小时的 idle key → 空闲窗口按小时重试
   h.fireDue();
   await h.flush();
   expect(h.sendCalls).toHaveLength(2);
-  expect(h.store.data.runs[1].resetKey).toMatch(/^idle:/);
+  expect(h.store.data.runs[1].resetKey).toBe("idle:2026-10-30T22:00:00.000Z");
+
+  h.advance(11 * 60_000); // 同一小时已试过 → 不再发
+  h.fireDue();
+  await h.flush();
+  expect(h.sendCalls).toHaveLength(2);
 });
 
 test("window：找不到窗口记一次失败，重复刷新不重复记录", async () => {
@@ -644,19 +644,51 @@ test("window：同一份旧 resetsAt 刷新/跨小时/重启均不重发，新 r
   await h2.flush();
   expect(h2.sendCalls).toHaveLength(0);
 
-  // Magpie 公布新的重置时间 → 按新 key 正常触发
+  // Magpie 公布新的重置时间，且到刷新时它已过 → 评估前先刷新，按新 R 立即开窗
+  //（不再拿旧快照空转一轮：评估永远基于刚刷新的数据）
   resetsAt = new Date(h2.now().getTime() + 8 * 60_000);
-  h2.advance(10 * 60_000); // 刷新拿到新 resetsAt（本轮评估仍用旧快照）
-  h2.fireDue();
-  await h2.flush();
-  expect(h2.sendCalls).toHaveLength(0);
-
-  h2.advance(10 * 60_000); // 用新快照评估 → 发送
+  h2.advance(10 * 60_000);
   h2.fireDue();
   await h2.flush();
   expect(h2.sendCalls).toHaveLength(1);
   expect(h2.store.data.runs.at(-1)!.resetKey).toBe(resetsAt.toISOString());
   expect(h2.store.data.marks[id].resetKeys).toContain(resetsAt.toISOString());
+});
+
+test("window：评估前先刷新——手动发送刚把窗口开起来，旧快照的空闲不再触发第二次", async () => {
+  // idle=true 时额度里是没开始的窗口（无 resetsAt）；手动发送后窗口开始，出现未来 resetsAt
+  let idle = true;
+  const h = await harness({
+    quotas: () => ({
+      entries: [{
+        provider: "openai", account: "acct-yang", label: "Y", viaKey: false,
+        windows: [{
+          name: "5h", used: idle ? 0 : 1,
+          resetsAt: idle ? null : new Date(h.now().getTime() + 5 * HOUR).toISOString(),
+        }],
+      }],
+    }),
+  });
+  const id = (await h.scheduler.upsert(dailyTask({
+    name: "开窗", trigger: { kind: "window", window: "5h" }, account: "acct-yang",
+  }))).id;
+  h.scheduler.start();
+  h.fireDue();
+  await h.flush();
+  // 快照新鲜 + 空闲窗口 + 本轮没发过 → 保存即发送，不再等 10 分钟
+  expect(h.sendCalls).toHaveLength(1);
+  expect(h.store.data.runs[0].resetKey).toMatch(/^idle:/);
+
+  // 等待期间用户手动又发了一次，窗口开始（resetsAt 出现）；下一个唤醒先刷新再评估
+  idle = false;
+  h.advance(10 * 60_000);
+  h.fireDue();
+  await h.flush();
+  expect(h.sendCalls).toHaveLength(1); // 不按旧快照的空闲再发
+  // 快照里的 resetsAt 是刷新时刻 + 5 小时，到期点再 + 30 秒宽限
+  expect(h.scheduler.snapshot().next[id]).toBe(
+    new Date(h.now().getTime() + 5 * HOUR + 30_000).toISOString(),
+  );
 });
 
 test("window：实际重置发送后，同小时内缓存丢掉 resetsAt 不再按 idle key 二次发送", async () => {

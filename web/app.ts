@@ -277,9 +277,12 @@ export function windowOptions(
   return list;
 }
 
-/** 窗口触发必须有账号：缺账号时取该供应商的第一个，没有则空（保存时会被拦下） */
+/** 窗口触发必须有账号：优先取该供应商第一个有窗口的账号（没有窗口的账号选不了窗口触发），
+ * 都没有就取第一个，再没有则空（保存时会被拦下）。换供应商时也用它预填，避免切来切去后
+ * 「窗口重置后」因为账号空着而不出现 */
 export function forceWindowAccount(providerId: string, providers: CatalogProvider[]): string {
-  return providers.find((p) => p.id === providerId)?.accounts[0]?.id ?? "";
+  const accounts = providers.find((p) => p.id === providerId)?.accounts ?? [];
+  return (accounts.find((a) => a.windows.length > 0) ?? accounts[0])?.id ?? "";
 }
 
 /** 发送到下方的提示行：自动给「自动选中 X」（按所选账号），两种情况都给思考结论与一句说明 */
@@ -969,6 +972,7 @@ function buildEditor(): HTMLElement {
 
   // 名称
   const name = el("input", "text") as HTMLInputElement;
+  name.dataset.fk = "name"; // 轮询重建后按这个键找回焦点（见 renderList）
   name.value = d.name;
   name.maxLength = NAME_MAX; // 与校验同上限，别让 41+ 字输进去才在保存时报错
   name.placeholder = "给任务起个名字";
@@ -986,8 +990,9 @@ function buildEditor(): HTMLElement {
     markDirty();
     if (!draft) return;
     draft.provider = v;
-    // 换供应商后账号与模型都回到未定状态；窗口触发立即挑一个账号，窗口名挑该账号的第一个
-    draft.account = draft.trigger.kind === "window" ? forceWindowAccount(v, providers) : "";
+    // 换供应商后模型回到未定；账号预填该供应商第一个有窗口的账号（两种触发都预填：
+    // 留空会让「窗口重置后」因为账号空着而不出现，切回来还得手动重选一次账号）
+    draft.account = forceWindowAccount(v, providers);
     if (draft.trigger.kind === "window") {
       draft.trigger = { kind: "window", window: windowOptions(v, draft.account, "", providers).find((o) => o.value)?.value ?? "" };
     }
@@ -1071,6 +1076,7 @@ function buildEditor(): HTMLElement {
   } else if (d.trigger.kind === "daily") {
     const ti = el("input") as HTMLInputElement;
     ti.type = "time";
+    ti.dataset.fk = "daily-time";
     ti.value = d.trigger.time;
     ti.addEventListener("change", () => {
       markDirty();
@@ -1096,6 +1102,7 @@ function buildEditor(): HTMLElement {
     }));
     const an = el("input") as HTMLInputElement;
     an.type = "datetime-local";
+    an.dataset.fk = "every-anchor";
     an.value = isoToLocalInput(d.trigger.anchor);
     an.addEventListener("change", () => {
       markDirty();
@@ -1298,6 +1305,9 @@ function rowEl(view: Task, saved: Task | null, isOpen: boolean): HTMLElement {
 function renderList(): void {
   const list = document.getElementById("list");
   if (!list) return;
+  // 重建会换掉整棵子树：正在输入的框（名称/时间/起点）焦点与光标要先记下，建完还回去。
+  // 不然轮询赶上一次重建，打字打到一半焦点就飞了
+  const focus = captureFocus(list);
   const tasks = state?.tasks ?? [];
   const confirming = deleteArmed(confirmDeleteAt, Date.now());
   const sig = JSON.stringify([
@@ -1337,6 +1347,39 @@ function renderList(): void {
     if (openId && draft) nodes.push(buildEditor());
     return nodes;
   });
+  restoreFocus(list, focus);
+}
+
+/** 正在聚焦的、带 data-fk 的输入框：键 + 光标区间（不支持选区的输入框为 null） */
+function captureFocus(root: HTMLElement): { key: string; start: number | null; end: number | null } | null {
+  const a = document.activeElement;
+  if (!(a instanceof HTMLInputElement) || !a.dataset.fk || !root.contains(a)) return null;
+  let start: number | null = null;
+  let end: number | null = null;
+  try {
+    start = a.selectionStart;
+    end = a.selectionEnd;
+  } catch {
+    /* type=time/datetime-local 没有选区 */
+  }
+  return { key: a.dataset.fk, start, end };
+}
+
+function restoreFocus(
+  root: HTMLElement,
+  focus: { key: string; start: number | null; end: number | null } | null,
+): void {
+  if (!focus) return;
+  const again = root.querySelector<HTMLInputElement>(`[data-fk="${focus.key}"]`);
+  if (!again) return;
+  again.focus();
+  if (focus.start !== null && focus.end !== null) {
+    try {
+      again.setSelectionRange(focus.start, focus.end);
+    } catch {
+      /* 该类型不支持选区，焦点回来即可 */
+    }
+  }
 }
 
 function renderSum(): void {
