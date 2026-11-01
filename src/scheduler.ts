@@ -14,7 +14,7 @@ import {
   type KeyDirectoryEntry,
 } from "./magpie-files";
 import { hourFloorISO, lastDue, nextDaily, nextEvery, upcoming, windowDue } from "./rules";
-import type { Store } from "./store";
+import type { Store, TaskMarks } from "./store";
 import type { QuotaEntry, RawModel, Run, SendResult, Task } from "./types";
 
 /** 单个定时器的最长睡眠：醒来重算，弥补系统睡眠/时钟跳变 */
@@ -385,7 +385,7 @@ export class Scheduler {
     return p;
   }
 
-  private marksOf(id: string): { lastDue: string | null; resetKeys: string[] } {
+  private marksOf(id: string): TaskMarks {
     let m = this.store.data.marks[id];
     if (!m) {
       m = { lastDue: null, resetKeys: [] };
