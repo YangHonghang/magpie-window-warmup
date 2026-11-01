@@ -275,12 +275,17 @@ export async function startService(opts: ServiceOptions): Promise<ServiceHandle>
 
   async function serveIndex(req: Request, url: URL): Promise<Response> {
     const nonce = randomBytes(16).toString("base64");
-    // token 与主题一起进 boot 数据块；JSON 里的 < 转义掉，杜绝提前闭合脚本标签
-    const boot = JSON.stringify({
+    // token 与主题一起进 boot 数据块；JSON 里的 < 转义掉，杜绝提前闭合脚本标签。
+    // lang 透传给页面跟随 magpie 的界面语言；只放行字母与连字符（BCP-47 标签的形态），
+    // 其余字符一律不带，异常值交给页面回退中文。
+    const bootData: Record<string, string> = {
       token,
       theme: url.searchParams.get("theme") ?? "",
       tokens: url.searchParams.get("tokens") ?? "",
-    }).replaceAll("<", "\\u003c");
+    };
+    const lang = url.searchParams.get("lang") ?? "";
+    if (/^[a-zA-Z-]{2,10}$/.test(lang)) bootData.lang = lang;
+    const boot = JSON.stringify(bootData).replaceAll("<", "\\u003c");
     let html: string;
     try {
       html = await readFile(join(uiDir, "index.html"), "utf8");

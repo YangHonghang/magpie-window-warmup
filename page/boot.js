@@ -12,22 +12,35 @@
 // 的 magpie.page.service 声明了它）。有就跳那里；没有（桌面窗口，或旧版
 // magpie）就照旧跳 127.0.0.1。
 //
-// 顺手把窗口的主题和设计令牌一起带上（magpie 的 bridge 已经把它们算好了），
-// 这样窗口预热页的配色跟窗口完全一致，连用户的自定义主题也算在内。
+// 顺手把窗口的主题、界面语言和设计令牌一起带上（magpie 的 bridge 已经把它们算好了），
+// 这样窗口预热页的配色跟窗口完全一致，连用户的自定义主题也算在内；语言跟随 magpie 本身，
+// 页面不再有自己的语言设置。
 (async () => {
   const DEFAULT_PORT = 3492;
   let port = DEFAULT_PORT;
   let theme = "";
   let tokens = null;
   let service = "";
+  let lang = "";
 
   try {
-    const t = await window.magpie?.ready;           // { dark, tokens }
+    const t = await window.magpie?.ready;           // { dark, lang, tokens }
     if (t) {
       if (typeof t.dark === "boolean") theme = t.dark ? "dark" : "light";
       if (t.tokens && typeof t.tokens === "object") tokens = t.tokens;
+      if (typeof t.lang === "string" && t.lang) lang = t.lang;
     }
   } catch { /* 没有 bridge 就退回默认主题 */ }
+  try {
+    // 带路页自己的提示语也跟着 magpie 的语言走（认不出就保持中文默认）
+    const said = document.getElementById("said");
+    if (said) {
+      const l = lang.toLowerCase();
+      if (l.startsWith("en")) said.textContent = "Connecting to the local Window Warmup service…";
+      else if (l === "zh-tw" || l === "zh-hk" || l === "zh-hant") said.textContent = "正在連線到本機視窗預熱服務…";
+      else if (l.startsWith("ja")) said.textContent = "ローカルのウィンドウ予熱サービスに接続しています…";
+    }
+  } catch { /* 保持中文默认 */ }
   try {
     const s = window.magpie?.service;
     if (typeof s === "string" && /^https?:\/\//.test(s)) service = s;
@@ -39,6 +52,7 @@
 
   const q = new URLSearchParams();
   if (theme) q.set("theme", theme);
+  if (lang) q.set("lang", lang);
   {
     // 只留非空的令牌，压成一个短串；令牌本身就是 magpie 自己的 CSS 变量值。
     const slim = {};

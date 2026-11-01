@@ -1995,11 +1995,15 @@ async function startService(opts) {
   }
   async function serveIndex(req, url) {
     const nonce = randomBytes(16).toString("base64");
-    const boot = JSON.stringify({
+    const bootData = {
       token,
       theme: url.searchParams.get("theme") ?? "",
       tokens: url.searchParams.get("tokens") ?? ""
-    }).replaceAll("<", "\\u003c");
+    };
+    const lang = url.searchParams.get("lang") ?? "";
+    if (/^[a-zA-Z-]{2,10}$/.test(lang))
+      bootData.lang = lang;
+    const boot = JSON.stringify(bootData).replaceAll("<", "\\u003c");
     let html;
     try {
       html = await readFile3(join3(uiDir, "index.html"), "utf8");
