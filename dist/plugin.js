@@ -2073,7 +2073,7 @@ async function startService(opts) {
       "cache-control": "no-store",
       "referrer-policy": "no-referrer",
       "x-content-type-options": "nosniff",
-      "content-security-policy": `default-src 'self'; script-src 'self' 'nonce-${nonce}'; ` + "connect-src 'self'; frame-ancestors *"
+      "content-security-policy": `default-src 'self'; script-src 'self' 'nonce-${nonce}'; ` + "connect-src 'self' http: https:; frame-ancestors *"
     };
     return new Response(req.method === "HEAD" ? null : html, { headers });
   }

@@ -96,7 +96,8 @@ test("首页注入 nonce boot JSON（含 token）并带 CSP", async () => {
   const csp = res.headers.get("content-security-policy") ?? "";
   expect(csp).toContain("default-src 'self'");
   expect(csp).toContain("script-src 'self'");
-  expect(csp).toContain("connect-src 'self'");
+  // sandbox 框架里 WebKit 的 'self' 匹配不上 opaque origin，必须另带 scheme 源，否则 Safari 下 /api/* 全被拦
+  expect(csp).toContain("connect-src 'self' http: https:");
   expect(csp).toContain("frame-ancestors *");
   expect(csp).toContain(`nonce-${nonce}`);
   expect(token).toMatch(/^[0-9a-f]{64}$/); // 32 字节 hex

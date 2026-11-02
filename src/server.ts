@@ -313,6 +313,11 @@ export async function startService(opts: ServiceOptions): Promise<ServiceHandle>
       "</head>",
       `<script type="application/json" id="boot" nonce="${nonce}">${boot}</script>\n</head>`,
     );
+    // connect-src 不能只写 'self'：页面在 sandbox 框架里是 opaque origin，WebKit（iOS / macOS
+    // Safari、经 magpie web 打开的 PWA）的 'self' 什么都匹配不上，/api/* 全被 CSP 拦掉；
+    // Chromium 按 URL 匹配所以没事。经 magpie web 转发时 Host 已被改成 127.0.0.1，服务端
+    // 也无从得知页面的真实地址，只能放宽到 http/https。脚本仍只认 nonce 与本服务自身，
+    // 渲染一律 textContent，放宽 connect-src 不额外打开注入口。
     const headers = {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
@@ -320,7 +325,7 @@ export async function startService(opts: ServiceOptions): Promise<ServiceHandle>
       "x-content-type-options": "nosniff",
       "content-security-policy":
         `default-src 'self'; script-src 'self' 'nonce-${nonce}'; ` +
-        "connect-src 'self'; frame-ancestors *",
+        "connect-src 'self' http: https:; frame-ancestors *",
     };
     // HEAD 只给头不带体（安全头与 GET 一致），语义上不把整页带上
     return new Response(req.method === "HEAD" ? null : html, { headers });
