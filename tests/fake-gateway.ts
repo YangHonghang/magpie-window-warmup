@@ -39,6 +39,8 @@ export interface FakeGatewayOpts {
   quotasStatus?: number;
   /** 完整读取（不带 kept）的状态码；缺省跟随 quotasStatus（额度接口挂了两种读法都挂） */
   fullQuotasStatus?: number;
+  /** 单卡刷新（POST /v1/magpie/quotas/refresh）的状态码 */
+  refreshStatus?: number;
   /** 完整读取（不带 kept）的延迟毫秒数，用于并发合并测试 */
   fullQuotasDelayMs?: number;
   /** chat 端点的固定应答，或按请求体动态应答 */
@@ -81,6 +83,9 @@ export function fakeGateway(opts: FakeGatewayOpts = {}): FakeGateway {
       requests.push(entry);
       if (url.pathname === "/v1/models") {
         return reply(opts.modelsStatus ?? 200, { data: opts.models ?? [] });
+      }
+      if (url.pathname === "/v1/magpie/quotas/refresh" && req.method === "POST") {
+        return reply(opts.refreshStatus ?? 200, { data: [] });
       }
       if (url.pathname === "/v1/magpie/quotas") {
         const kept = url.searchParams.get("kept") === "1";

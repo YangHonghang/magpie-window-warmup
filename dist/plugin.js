@@ -322,6 +322,7 @@ var SEND_MAX_TOKENS = 16;
 var SEND_TIMEOUT_MS = 30000;
 var READ_TIMEOUT_MS = 1e4;
 var FULL_QUOTAS_TIMEOUT_MS = 15000;
+var CARD_REFRESH_TIMEOUT_MS = 35000;
 var MIN_FULL_GAP_MS = 5 * 60000;
 var REASON_MAX = 200;
 function timeoutReason(timeoutMs) {
@@ -411,9 +412,10 @@ function errorReason(text) {
 function errText(e) {
   return e instanceof Error ? e.message : String(e);
 }
-async function requestJSON(base, path, signal, timeoutMs = READ_TIMEOUT_MS) {
+async function requestJSON(base, path, signal, timeoutMs = READ_TIMEOUT_MS, method = "GET") {
   const timeout = AbortSignal.timeout(timeoutMs);
   const res = await fetch(base + path, {
+    method,
     signal: signal ? AbortSignal.any([signal, timeout]) : timeout
   });
   const text = await res.text().catch(() => "");
@@ -459,12 +461,14 @@ function parseQuotas(data) {
     const user = typeof q.user === "string" ? q.user : "";
     if (!provider || !user)
       continue;
+    const readAt = typeof q.readAt === "string" && q.readAt ? q.readAt : null;
     entries.push({
       provider,
       account: user,
       label: typeof q.name === "string" && q.name ? q.name : user,
       windows: coerceWindows(q.windows),
-      viaKey
+      viaKey,
+      ...readAt ? { readAt } : {}
     });
   }
   return entries;
@@ -497,6 +501,10 @@ function createQuotaReader(opts = {}) {
     }
     return pending;
   };
+}
+async function refreshQuotaCard(base, provider, user) {
+  const q = new URLSearchParams({ provider, user });
+  await requestJSON(base, `/v1/magpie/quotas/refresh?${q}`, undefined, CARD_REFRESH_TIMEOUT_MS, "POST");
 }
 var fetchQuotas = createQuotaReader();
 async function fetchModels(base, signal) {
@@ -940,6 +948,9 @@ function validateTask(input, now) {
 import { randomUUID } from "crypto";
 var TIMER_CAP_MS = 600000;
 var QUOTA_REFRESH_MS = 600000;
+var POST_SEND_SETTLE_MS = 60000;
+var CARD_FRESH_MS = 60000;
+var CARD_REFRESH_GAP_MS = 60000;
 var HOUR_MS2 = 3600000;
 var DAY_MS = 24 * HOUR_MS2;
 var INTERRUPTED_REASON = "Magpie \u5728\u53D1\u9001\u4E2D\u9014\u9000\u51FA\uFF0C\u7ED3\u679C\u672A\u77E5";
@@ -959,6 +970,7 @@ class Scheduler {
   setTimerFn;
   sendFn;
   quotasFn;
+  refreshCardFn;
   modelsFn;
   keyDirFn;
   modelCacheFn;
@@ -975,6 +987,7 @@ class Scheduler {
   quotaTried = false;
   saveError = null;
   lastErrKey = new Map;
+  lastCardRefresh = new Map;
   constructor(deps) {
     this.store = deps.store;
     this.base = deps.base;
@@ -985,6 +998,7 @@ class Scheduler {
     });
     this.sendFn = deps.sendFn ?? send;
     this.quotasFn = deps.quotasFn ?? fetchQuotas;
+    this.refreshCardFn = deps.refreshCardFn ?? refreshQuotaCard;
     this.modelsFn = deps.modelsFn ?? fetchModels;
     const dirs = magpieDirs();
     this.keyDirFn = deps.keyDirFn ?? (() => readKeyDirectory(dirs.config).catch(() => null));
@@ -1203,8 +1217,13 @@ class Scheduler {
     const now = this.nowFn();
     const tasks = this.store.data.tasks;
     const hasWindow = tasks.some((t) => t.enabled && t.trigger.kind === "window");
-    if (hasWindow)
+    if (hasWindow) {
       await this.refreshQuotas();
+      if (await this.readCards(now)) {
+        this.quotaStale = true;
+        await this.refreshQuotas();
+      }
+    }
     for (const task of [...tasks]) {
       if (!task.enabled)
         continue;
@@ -1272,12 +1291,17 @@ class Scheduler {
     if ("error" in due)
       return { at: snap.at, error: due.error };
     const raw = win?.resetsAt;
-    if (raw && !Number.isNaN(new Date(raw).getTime())) {
+    const rawValid = !!raw && !Number.isNaN(new Date(raw).getTime());
+    if (raw && rawValid) {
       const mark = this.marksOf(task.id);
       if (mark.lastReset !== raw) {
         mark.lastReset = raw;
         this.trackSave();
       }
+    }
+    if (due.resetKey.startsWith("idle:") && this.staleIdle(task))
+      return null;
+    if (raw && rawValid) {
       if (due.resetKey.startsWith("idle:")) {
         return { at: due.at, resetKey: raw };
       }
@@ -1289,6 +1313,43 @@ class Scheduler {
     if (seenFuture)
       return null;
     return due;
+  }
+  loginCard(task) {
+    return this.quota?.entries.find((q) => q.provider === task.provider && !q.viaKey && q.account === task.account) ?? null;
+  }
+  lastSentMs(task) {
+    const v = this.store.data.marks[task.id]?.lastSent;
+    return v ? new Date(v).getTime() : NaN;
+  }
+  staleIdle(task) {
+    const readAt = new Date(this.loginCard(task)?.readAt ?? "").getTime();
+    const sent = this.lastSentMs(task);
+    return Number.isFinite(readAt) && Number.isFinite(sent) && readAt < sent + POST_SEND_SETTLE_MS;
+  }
+  async readCards(now) {
+    let asked = false;
+    for (const task of this.store.data.tasks) {
+      if (!task.enabled || task.trigger.kind !== "window")
+        continue;
+      const card = this.loginCard(task);
+      if (!card)
+        continue;
+      const readAt = new Date(card.readAt ?? "").getTime();
+      const settled = this.lastSentMs(task) + POST_SEND_SETTLE_MS;
+      const afterSend = now.getTime() >= settled && readAt < settled;
+      const info = this.windowInfo(task, now);
+      const dueNow = info !== null && !("error" in info) && info.at.getTime() <= now.getTime() && !this.marksOf(task.id).resetKeys.includes(info.resetKey) && !(now.getTime() - readAt <= CARD_FRESH_MS);
+      if (!afterSend && !dueNow)
+        continue;
+      const key = `${card.provider}|${card.account}`;
+      const last = this.lastCardRefresh.get(key);
+      if (last !== undefined && now.getTime() - last < CARD_REFRESH_GAP_MS)
+        continue;
+      this.lastCardRefresh.set(key, now.getTime());
+      asked = true;
+      await this.refreshCardFn(this.base, card.provider, card.account).catch(() => {});
+    }
+    return asked;
   }
   snapshotFresh(now) {
     return this.quota !== null && !this.quotaStale && now.getTime() - this.quota.at.getTime() < QUOTA_REFRESH_MS;
@@ -1374,6 +1435,7 @@ class Scheduler {
       const persisted = await savedRunning;
       let effort = null;
       let result;
+      let sent = false;
       if (!persisted) {
         result = {
           outcome: "failed",
@@ -1393,6 +1455,7 @@ class Scheduler {
             } else {
               effort = pick.send;
               run.model = resolved.id;
+              sent = true;
               result = await this.sendFn(this.base, { id: task.id, model: resolved.id }, resolved.pin, effort, entry.abort.signal);
             }
           }
@@ -1415,7 +1478,12 @@ class Scheduler {
       run.endedAt = this.nowFn().toISOString();
       if (!this.store.data.tasks.some((t) => t.id === task.id))
         return;
+      const opened = sent && !entry.cancel && result.outcome !== "failed" && task.trigger.kind === "window";
+      if (opened)
+        this.marksOf(task.id).lastSent = run.endedAt;
       await this.trackSave();
+      if (opened)
+        this.rearm();
     } finally {
       this.inflight.delete(task.id);
     }
@@ -1453,6 +1521,9 @@ class Scheduler {
       if (!task.enabled)
         continue;
       if (task.trigger.kind === "window") {
+        const settled = this.lastSentMs(task) + POST_SEND_SETTLE_MS;
+        if (settled > now.getTime())
+          minDelay = Math.min(minDelay, settled - now.getTime());
         const info = this.windowInfo(task, now);
         if (info && !("error" in info) && info.at.getTime() > now.getTime()) {
           minDelay = Math.min(minDelay, info.at.getTime() - now.getTime());

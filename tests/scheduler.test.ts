@@ -43,6 +43,8 @@ interface TimerRec { fn: () => void; at: number; cancelled: boolean }
 interface HarnessOpts {
   models?: RawModel[];
   quotas?: () => { entries: QuotaEntry[] };
+  /** 单卡刷新的替身（改写 quotas 的数据源模拟 Magpie 重读了卡）；不传 = 空操作 */
+  refresh?: (provider: string, user: string) => void | Promise<void>;
   sendImpl?: (call: SendCall) => Promise<SendResult>;
   /** 复用已有数据目录（模拟重启续跑） */
   dir?: string;
@@ -64,6 +66,8 @@ interface Harness {
   sendCalls: SendCall[];
   models: RawModel[];
   quotasCalls: number;
+  /** 单卡刷新调用：[供应商, 账号] */
+  refreshCalls: [string, string][];
   advance: (delta: number) => void;
   now: () => Date;
   fireDue: () => void;
@@ -120,6 +124,11 @@ async function harness(opts: HarnessOpts = {}): Promise<Harness> {
         return { at: now(), entries: opts.quotas!().entries };
       }
     : undefined;
+  const refreshCalls: [string, string][] = [];
+  const refreshCardFn = async (_base: string, provider: string, user: string) => {
+    refreshCalls.push([provider, user]);
+    await opts.refresh?.(provider, user);
+  };
 
   const rawStore = await openStore(dir);
   const store = opts.storeWrap ? opts.storeWrap(rawStore) : rawStore;
@@ -131,6 +140,7 @@ async function harness(opts: HarnessOpts = {}): Promise<Harness> {
     sendFn,
     modelsFn: async () => models,
     ...(quotasFn ? { quotasFn } : {}),
+    refreshCardFn,
     // key 目录与模型缓存一律注入替身，测试进程不碰真实文件
     keyDirFn: opts.keyDirFn ?? (async () => opts.keyDir ?? null),
     modelCacheFn: async (pid) => opts.modelCache?.(pid) ?? null,
@@ -138,6 +148,7 @@ async function harness(opts: HarnessOpts = {}): Promise<Harness> {
   return {
     scheduler, store, sendCalls, models,
     get quotasCalls() { return quotasCalls; },
+    refreshCalls,
     advance, now, fireDue, pendingTimers, flush: () => scheduler.flush(), dir,
   };
 }
@@ -971,4 +982,93 @@ test("window：窗口在计时但额度卡瞬断丢了 resetsAt → 不当空闲
   await h.flush();
   expect(h.sendCalls).toHaveLength(0);
   expect(h.scheduler.snapshot().next[id]).toBe(new Date(ms(T0) + 11 * HOUR + 30_000).toISOString());
+});
+
+// ---------- 额度缓存滞后（Docker 实机 2026-11-02）：magpie web 无托盘时只在路由请求那一刻读卡，
+// 读到的是发送前的空闲，之后无人再读；插件跨整点把旧空闲当新事件，每次开窗后都多发一次 ----------
+
+interface Card { readAt: string; resetsAt: string | null }
+
+function zcodeCard(card: () => Card): () => { entries: QuotaEntry[] } {
+  return () => ({
+    entries: [{
+      provider: "zcode", account: "a@b.c", label: "A", viaKey: false, readAt: card().readAt,
+      windows: [{ name: "5 hours", used: 0, resetsAt: card().resetsAt }],
+    }],
+  });
+}
+
+const zcodeWindowTask = () => dailyTask({
+  name: "开窗", provider: "zcode", account: "a@b.c", trigger: { kind: "window", window: "5 hours" },
+});
+
+test("window：发送后缓存一直停在发送前的空闲读数 → 跨整点也不重发", async () => {
+  // 单卡刷新也没拿到新读数（替身空操作）：readAt 早于上次发送，空闲不可信，宁可不发
+  const card: Card = { readAt: new Date(ms(T0)).toISOString(), resetsAt: null };
+  const h = await harness({ quotas: zcodeCard(() => card) });
+  await h.scheduler.upsert(zcodeWindowTask());
+  h.scheduler.start();
+  h.fireDue();
+  await h.flush();
+  expect(h.sendCalls).toHaveLength(1);
+
+  for (let i = 0; i < 18; i++) { // 3 小时，跨 3 个整点
+    h.advance(10 * 60_000);
+    h.fireDue();
+    await h.flush();
+  }
+  expect(h.sendCalls).toHaveLength(1);
+  expect(h.refreshCalls.length).toBeGreaterThan(0); // 期间一直在设法拿新读数
+  expect(h.refreshCalls.every(([p, u]) => p === "zcode" && u === "a@b.c")).toBe(true);
+});
+
+test("window：到期先单卡刷新，刷新后看到窗口已在计时 → 不发，排到新的 resetsAt+30s", async () => {
+  const reset = new Date(ms(T0) + 3 * HOUR).toISOString();
+  let card: Card = { readAt: new Date(ms(T0) - 2 * HOUR).toISOString(), resetsAt: null };
+  const h: Harness = await harness({
+    quotas: zcodeCard(() => card),
+    refresh: () => { card = { readAt: h.now().toISOString(), resetsAt: reset }; },
+  });
+  const id = (await h.scheduler.upsert(zcodeWindowTask())).id;
+  h.scheduler.start();
+  h.fireDue();
+  await h.flush();
+  expect(h.refreshCalls).toEqual([["zcode", "a@b.c"]]);
+  expect(h.sendCalls).toHaveLength(0);
+  expect(h.scheduler.snapshot().next[id]).toBe(new Date(ms(reset) + 30_000).toISOString());
+});
+
+test("window：发送 60 秒后单卡刷新拿到新 resetsAt 精确排程；到期后新读数为空闲才再发", async () => {
+  let card: Card = { readAt: new Date(ms(T0)).toISOString(), resetsAt: null };
+  let opened: string | null = null; // 厂商侧：发送开窗后的重置时间
+  const h: Harness = await harness({
+    quotas: zcodeCard(() => card),
+    refresh: () => {
+      const live = opened !== null && ms(opened) > h.now().getTime() ? opened : null;
+      card = { readAt: h.now().toISOString(), resetsAt: live };
+    },
+    sendImpl: async () => {
+      opened = new Date(h.now().getTime() + 5 * HOUR).toISOString();
+      return { outcome: "ok", reason: "", ms: 2 };
+    },
+  });
+  const id = (await h.scheduler.upsert(zcodeWindowTask())).id;
+  h.scheduler.start();
+  h.fireDue();
+  await h.flush();
+  expect(h.sendCalls).toHaveLength(1);
+  expect(h.refreshCalls).toHaveLength(0); // 读数刚读的，不必再刷
+  // 发送后唤醒排在 60 秒后，专门去拿开窗后的读数
+  expect(h.pendingTimers().some((t) => t.at === ms(T0) + 60_000)).toBe(true);
+
+  h.advance(60_000);
+  h.fireDue();
+  await h.flush();
+  expect(h.refreshCalls).toHaveLength(1);
+  expect(h.scheduler.snapshot().next[id]).toBe(new Date(ms(opened!) + 30_000).toISOString());
+
+  h.advance(5 * HOUR - 60_000 + 30_000); // 到 resetsAt+30s
+  h.fireDue();
+  await h.flush();
+  expect(h.sendCalls).toHaveLength(2);
 });

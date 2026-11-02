@@ -64,6 +64,8 @@ export interface QuotaEntry {
   windows: QuotaWindow[];
   /** true = 远程 Magpie 给单把 key 发的限额卡（原 provider 形如 "<p>/~keys"，user 是 key 名或打码） */
   viaKey: boolean;
+  /** magpie 上次向上游读这张卡的时刻（ISO）；旧版 magpie 不给 */
+  readAt?: string;
 }
 
 /** /v1/models 的单条原始对象；档位字段形状随模型而变，使用前需运行时校验 */

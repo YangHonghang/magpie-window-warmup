@@ -32,6 +32,8 @@ export interface TaskMarks {
   /** 这个任务的窗口最近一次见到的重置时间（ISO）：额度卡瞬断丢了 resetsAt 时，
    * 用它区分「窗口其实在计时」和「真空闲」；旧数据没有这个字段照常加载 */
   lastReset?: string | null;
+  /** 窗口任务最近一次真正把消息发出去的收尾时刻（ISO）：此前读到的空闲是发送前的旧读数，不可信 */
+  lastSent?: string | null;
 }
 
 export interface StateFile {

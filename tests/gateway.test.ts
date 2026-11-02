@@ -12,6 +12,7 @@ import {
   modelProvider,
   pickAutoModel,
   pickEffort,
+  refreshQuotaCard,
   send,
   WARMUP_MESSAGE,
 } from "../src/gateway";
@@ -510,6 +511,33 @@ describe("fetchQuotas", () => {
     });
     const snap = await fetchQuotas(gw.base);
     expect(snap.entries[0].windows).toEqual([{ name: "5h", used: 2, resetsAt: FUTURE }]);
+  });
+
+  test("卡片的读取时刻 readAt 原样带出（纳秒精度的串也能解析）", async () => {
+    const readAt = "2026-11-02T09:44:34.222418286+08:00";
+    const gw = start({
+      quotas: [{ provider: "zcode", user: "a@b.c", name: "Z", readAt, windows: [] }],
+    });
+    const snap = await fetchQuotas(gw.base);
+    expect(snap.entries[0].readAt).toBe(readAt);
+    expect(new Date(snap.entries[0].readAt!).toISOString()).toBe("2026-11-02T01:44:34.222Z");
+  });
+});
+
+describe("refreshQuotaCard", () => {
+  test("POST 单卡刷新接口，供应商与账号按查询参数编码", async () => {
+    const gw = start();
+    await refreshQuotaCard(gw.base, "zcode", "ho****ng@qq.com");
+    const req = gw.requests.find((r) => r.path === "/v1/magpie/quotas/refresh");
+    expect(req?.method).toBe("POST");
+    const q = new URLSearchParams(req!.search);
+    expect(q.get("provider")).toBe("zcode");
+    expect(q.get("user")).toBe("ho****ng@qq.com");
+  });
+
+  test("接口报错如实抛出", async () => {
+    const gw = start({ refreshStatus: 403 });
+    await expect(refreshQuotaCard(gw.base, "zcode", "a")).rejects.toThrow("HTTP 403");
   });
 });
 

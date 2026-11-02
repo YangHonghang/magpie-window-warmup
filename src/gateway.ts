@@ -31,6 +31,8 @@ const READ_TIMEOUT_MS = 10_000;
  * （internal/gateway/gateway.go quotas 的 ctx timeout），放宽到 15 秒兜住网络往返。
  */
 const FULL_QUOTAS_TIMEOUT_MS = 15_000;
+/** 单卡刷新的超时：magpie 侧给这次上游读取 30 秒（gateway.go quotaCardsRefresh），再放宽兜住往返 */
+const CARD_REFRESH_TIMEOUT_MS = 35_000;
 /** 两次完整额度读取的最小间隔：kept 缓存空窗期（magpie 刚启动）内的兜底读取不许每次都打 */
 const MIN_FULL_GAP_MS = 5 * 60_000;
 /** 上游错误原因截断长度，避免个别上游把整页 HTML 塞进 error.message */
@@ -146,11 +148,13 @@ async function requestJSON(
   path: string,
   signal?: AbortSignal,
   timeoutMs: number = READ_TIMEOUT_MS,
+  method: "GET" | "POST" = "GET",
 ): Promise<unknown> {
   // 外部 signal（发送被停用/删除）与读超时一并生效，取元数据阶段也能被立即中止。
   // 连接失败不包装：底层原始错误如实抛给上层显示
   const timeout = AbortSignal.timeout(timeoutMs);
   const res = await fetch(base + path, {
+    method,
     signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   });
   const text = await res.text().catch(() => "");
@@ -202,12 +206,14 @@ function parseQuotas(data: unknown): QuotaEntry[] {
     const provider = viaKey ? rawProvider.slice(0, -"/~keys".length) : rawProvider;
     const user = typeof q.user === "string" ? q.user : "";
     if (!provider || !user) continue;
+    const readAt = typeof q.readAt === "string" && q.readAt ? q.readAt : null;
     entries.push({
       provider,
       account: user,
       label: typeof q.name === "string" && q.name ? q.name : user,
       windows: coerceWindows(q.windows),
       viaKey,
+      ...(readAt ? { readAt } : {}),
     });
   }
   return entries;
@@ -258,6 +264,16 @@ export function createQuotaReader(opts: { now?: () => Date } = {}): QuotasFn {
     }
     return pending;
   };
+}
+
+/**
+ * 让 magpie 去上游重读一张订阅卡（用量页单卡「刷新」按钮的同一路径），重读结果进 kept 缓存，
+ * 下一次 ?kept=1 即可读到。magpie 按卡限频 30 秒，限频内不报错只是不重读——调用方靠
+ * 卡片的 readAt 判断是否真拿到了新读数。响应体是另一种卡片形态，这里不解析。
+ */
+export async function refreshQuotaCard(base: string, provider: string, user: string): Promise<void> {
+  const q = new URLSearchParams({ provider, user });
+  await requestJSON(base, `/v1/magpie/quotas/refresh?${q}`, undefined, CARD_REFRESH_TIMEOUT_MS, "POST");
 }
 
 /** 默认读取器：进程内唯一，目录与调度器（未注入 quotasFn 时）共用同一份完整读取缓存 */

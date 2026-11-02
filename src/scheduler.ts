@@ -5,7 +5,7 @@
 // 单个定时器，延迟 = min(最近到期 − now, 10 分钟)，每次醒来重算（抵御睡眠与改系统时间）。
 import { randomUUID } from "node:crypto";
 import { modelsForAccount, pinFor, pickAutoModel, windowsForAccount } from "./accounts";
-import { fetchModels, fetchQuotas, modelProvider, pickEffort, send } from "./gateway";
+import { fetchModels, fetchQuotas, modelProvider, pickEffort, refreshQuotaCard, send } from "./gateway";
 import {
   magpieDirs,
   readKeyDirectory,
@@ -21,6 +21,15 @@ import type { QuotaEntry, RawModel, Run, SendResult, Task } from "./types";
 const TIMER_CAP_MS = 600_000;
 /** 窗口额度快照的刷新节奏：每 10 分钟及每次到期后 */
 const QUOTA_REFRESH_MS = 600_000;
+/**
+ * 发送后多久的读数才算「开窗后」：厂商记账有延迟，刚发完立刻读可能仍是空闲。
+ * 早于「上次发送 + 这段」的空闲读数不可信（见 staleIdle），发送后也按这个点去重读卡
+ */
+const POST_SEND_SETTLE_MS = 60_000;
+/** 窗口到期要发送时，卡片读数超过这个年龄就先让 magpie 重读一次 */
+const CARD_FRESH_MS = 60_000;
+/** 同一张卡两次重读请求的最小间隔（magpie 侧另有 30 秒限频） */
+const CARD_REFRESH_GAP_MS = 60_000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 /** snapshot 时间轴只画未来 24 小时 */
@@ -36,6 +45,7 @@ export const NOT_FOUND_MESSAGE = "任务不存在";
 
 export type SendFn = typeof send;
 export type QuotasFn = typeof fetchQuotas;
+export type RefreshCardFn = typeof refreshQuotaCard;
 /** 取模型元数据；signal 在停用/删除时传入，中止进行中的请求（测试假件可不实现） */
 export type ModelsFn = (base: string, signal?: AbortSignal) => Promise<RawModel[]>;
 /** 读 providers.json 的 key 目录；null = 读不出（指纹账号按「≥2 把 key」处理） */
@@ -56,6 +66,7 @@ export interface SchedulerDeps {
   setTimer?: TimerSetter;
   sendFn?: SendFn;
   quotasFn?: QuotasFn;
+  refreshCardFn?: RefreshCardFn;
   modelsFn?: ModelsFn;
   /** key 目录与模型缓存的读取器；缺省按 magpieDirs() 推导的默认位置读 */
   keyDirFn?: KeyDirFn;
@@ -100,6 +111,7 @@ export class Scheduler {
   private readonly setTimerFn: TimerSetter;
   private readonly sendFn: SendFn;
   private readonly quotasFn: QuotasFn;
+  private readonly refreshCardFn: RefreshCardFn;
   private readonly modelsFn: ModelsFn;
   private readonly keyDirFn: KeyDirFn;
   private readonly modelCacheFn: ModelCacheFn;
@@ -124,6 +136,8 @@ export class Scheduler {
   private saveError: string | null = null;
   /** 评估抛错的去重：taskId → 「小时|原因」，同一小时同一原因只记一条 */
   private lastErrKey = new Map<string, string>();
+  /** 「供应商|账号」→ 上次请求重读该卡的时刻 */
+  private lastCardRefresh = new Map<string, number>();
 
   constructor(deps: SchedulerDeps) {
     this.store = deps.store;
@@ -137,6 +151,7 @@ export class Scheduler {
       });
     this.sendFn = deps.sendFn ?? send;
     this.quotasFn = deps.quotasFn ?? fetchQuotas;
+    this.refreshCardFn = deps.refreshCardFn ?? refreshQuotaCard;
     this.modelsFn = deps.modelsFn ?? fetchModels;
     // 目录位置进程内不变，构造时推导一次；providers.json 损坏按「读不出」处理（null）
     const dirs = magpieDirs();
@@ -401,7 +416,13 @@ export class Scheduler {
     const hasWindow = tasks.some((t) => t.enabled && t.trigger.kind === "window");
     // 评估前先把快照刷到最新（refreshQuotas 对新鲜快照是空操作）：
     // 拿过期快照评估会在睡眠醒来、手动发送刚开窗之后，按旧的空闲窗口再发一次
-    if (hasWindow) await this.refreshQuotas();
+    if (hasWindow) {
+      await this.refreshQuotas();
+      if (await this.readCards(now)) {
+        this.quotaStale = true;
+        await this.refreshQuotas();
+      }
+    }
     for (const task of [...tasks]) {
       if (!task.enabled) continue;
       try {
@@ -470,13 +491,19 @@ export class Scheduler {
     const due = windowDue(win, snap.at);
     if ("error" in due) return { at: snap.at, error: due.error };
     const raw = win?.resetsAt;
-    if (raw && !Number.isNaN(new Date(raw).getTime())) {
+    const rawValid = !!raw && !Number.isNaN(new Date(raw).getTime());
+    if (raw && rawValid) {
       // 记下最近见到的重置时间（变了才落盘）：额度卡瞬断丢了 resetsAt 时靠它分辨真假空闲
       const mark = this.marksOf(task.id);
       if (mark.lastReset !== raw) {
         mark.lastReset = raw;
         void this.trackSave();
       }
+    }
+    // 空闲读数早于上次发送：那是发送前读的（magpie 只在路由请求那一刻读卡），当没数据，
+    // 等 readCards 拿到发送后的读数再判断——否则跨整点 idle key 一变就会再发一次
+    if (due.resetKey.startsWith("idle:") && this.staleIdle(task)) return null;
+    if (raw && rawValid) {
       // 只要窗口带着可解析的 resetsAt，key 就用 resetsAt 本身：与重置发送同 key，消费过
       // 就绝不再发（刷新/跨小时/重启都一样），出现新 resetsAt 才是新事件；
       // truthy 但解析不了的 resetsAt 当缺失处理，保留按小时限频。
@@ -501,6 +528,62 @@ export class Scheduler {
       );
     if (seenFuture) return null;
     return due;
+  }
+
+  /** 任务账号的订阅卡（本机可重读的那种）；key 卡来自远程 magpie，返回 null */
+  private loginCard(task: Task): QuotaEntry | null {
+    return (
+      this.quota?.entries.find(
+        (q) => q.provider === task.provider && !q.viaKey && q.account === task.account,
+      ) ?? null
+    );
+  }
+
+  /** 窗口任务上次真正发出的收尾时刻（毫秒）；没有为 NaN */
+  private lastSentMs(task: Task): number {
+    const v = this.store.data.marks[task.id]?.lastSent;
+    return v ? new Date(v).getTime() : NaN;
+  }
+
+  /** 卡片读数早于「上次发送 + 记账余量」；拿不到 readAt（旧版 magpie）时不设门槛 */
+  private staleIdle(task: Task): boolean {
+    const readAt = new Date(this.loginCard(task)?.readAt ?? "").getTime();
+    const sent = this.lastSentMs(task);
+    return Number.isFinite(readAt) && Number.isFinite(sent) && readAt < sent + POST_SEND_SETTLE_MS;
+  }
+
+  /**
+   * 该重读的订阅卡让 magpie 现读一次，返回是否发起过。kept 缓存只在 magpie 路由请求那一刻
+   * 更新（无托盘的 magpie web 平时不读卡），两种时机需要新读数：
+   * - 窗口按当前快照到期、马上要发：读数超过 1 分钟就先重读，别按旧空闲白发；
+   * - 发送已满记账余量、读数还早于那时：拿开窗后的 resetsAt，定时器才能精确排到重置点。
+   * 重读失败不记失败：staleIdle 门槛兜着，下一轮再试
+   */
+  private async readCards(now: Date): Promise<boolean> {
+    let asked = false;
+    for (const task of this.store.data.tasks) {
+      if (!task.enabled || task.trigger.kind !== "window") continue;
+      const card = this.loginCard(task);
+      if (!card) continue;
+      const readAt = new Date(card.readAt ?? "").getTime();
+      const settled = this.lastSentMs(task) + POST_SEND_SETTLE_MS;
+      const afterSend = now.getTime() >= settled && readAt < settled;
+      const info = this.windowInfo(task, now);
+      const dueNow =
+        info !== null &&
+        !("error" in info) &&
+        info.at.getTime() <= now.getTime() &&
+        !this.marksOf(task.id).resetKeys.includes(info.resetKey) &&
+        !(now.getTime() - readAt <= CARD_FRESH_MS);
+      if (!afterSend && !dueNow) continue;
+      const key = `${card.provider}|${card.account}`;
+      const last = this.lastCardRefresh.get(key);
+      if (last !== undefined && now.getTime() - last < CARD_REFRESH_GAP_MS) continue;
+      this.lastCardRefresh.set(key, now.getTime());
+      asked = true;
+      await this.refreshCardFn(this.base, card.provider, card.account).catch(() => {});
+    }
+    return asked;
   }
 
   /** 额度快照是否新鲜：没过期且不是上次发送刚弄脏的 */
@@ -625,6 +708,7 @@ export class Scheduler {
       const persisted = await savedRunning;
       let effort: string | null = null;
       let result: SendResult;
+      let sent = false;
       if (!persisted) {
         result = {
           outcome: "failed",
@@ -644,6 +728,7 @@ export class Scheduler {
             } else {
               effort = pick.send;
               run.model = resolved.id;
+              sent = true;
               result = await this.sendFn(
                 this.base,
                 { id: task.id, model: resolved.id },
@@ -673,7 +758,11 @@ export class Scheduler {
       run.endedAt = this.nowFn().toISOString();
       // 收尾与删除竞态的最后一道闸：任务已不在就什么都不写
       if (!this.store.data.tasks.some((t) => t.id === task.id)) return;
+      // 真正发出去（含结果未知）就算开过窗：此前的空闲读数作废，并排一次发送后的重读
+      const opened = sent && !entry.cancel && result.outcome !== "failed" && task.trigger.kind === "window";
+      if (opened) this.marksOf(task.id).lastSent = run.endedAt;
       await this.trackSave();
+      if (opened) this.rearm();
     } finally {
       this.inflight.delete(task.id);
     }
@@ -719,6 +808,8 @@ export class Scheduler {
     for (const task of this.store.data.tasks) {
       if (!task.enabled) continue;
       if (task.trigger.kind === "window") {
+        const settled = this.lastSentMs(task) + POST_SEND_SETTLE_MS;
+        if (settled > now.getTime()) minDelay = Math.min(minDelay, settled - now.getTime());
         const info = this.windowInfo(task, now);
         if (info && !("error" in info) && info.at.getTime() > now.getTime()) {
           minDelay = Math.min(minDelay, info.at.getTime() - now.getTime());
