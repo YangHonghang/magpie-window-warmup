@@ -1,14 +1,17 @@
-import { WARMUP_MESSAGE } from "./gateway";
+// 纯规则：时间推算、窗口到期与任务校验。页面（web/app.ts）也直接打包本模块，
+// 因此这里只许依赖 types，不能引入任何 node:* 或网关模块。
 import type { QuotaWindow, Task, Trigger } from "./types";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
 /** 额度重置宽限：到期点取 resetsAt + 30s，确保 Magpie 侧已完成重置 */
-const RESET_GRACE_MS = 30_000;
+export const RESET_GRACE_MS = 30_000;
+/** 预热消息固定为 hi：探活用，不可配置（页面与校验都不再收自定义消息） */
+export const WARMUP_MESSAGE = "hi";
 /** 补发判断向前回看 48 小时：跨夏令时的日间隔最多 25 小时，足以覆盖最近一个应到点 */
 const LAST_DUE_LOOKBACK_MS = 48 * HOUR_MS;
-/** 名称的长度上限按 Unicode 码点计，与页面字数一致 */
-const NAME_MAX = 40;
+/** 名称的长度上限按 Unicode 码点计，页面校验共用同一个值 */
+export const NAME_MAX = 40;
 
 interface Wall {
   year: number;
@@ -48,7 +51,7 @@ function wallOf(t: Date, timeZone: string): Wall {
 }
 
 /** 时区偏移（毫秒，东正西负）。秒级截断，避免子秒噪声 */
-function offsetMs(t: Date, timeZone: string): number {
+export function offsetMs(t: Date, timeZone: string): number {
   const sec = Math.floor(t.getTime() / 1000) * 1000;
   const w = wallOf(new Date(sec), timeZone);
   return Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, sec / 1000 % 60) - sec;

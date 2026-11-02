@@ -1,4 +1,9 @@
-// 窗口预热插件的共享数据类型。运行时结构见 src/rules.ts 与后续任务的调度/服务模块。
+// 窗口预热插件的共享数据类型，外加各层（含浏览器端页面）都要用的极少量无依赖小工具。
+
+/** 异常转人话原因：Error 取 message，其余原样转字符串 */
+export function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
 
 export type Trigger =
   | { kind: "window"; window: string } // 额度窗口名，如 "5h"
@@ -10,7 +15,7 @@ export interface Task {
   name: string;
   enabled: boolean;
   provider: string;
-  /** "" 表示由供应商自动选账号；窗口触发不允许（同一 resetKey 只试一次，必须锁定账号） */
+  /** key 指纹或订阅账号名，新建/编辑时必填；"" 只会出现在旧版本存下的任务里（发送时不带账号头） */
   account: string;
   /** "" 表示自动选模型：每次发送前按 pickAutoModel 现算，任务里不存选中值 */
   model: string;

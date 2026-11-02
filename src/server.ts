@@ -11,6 +11,7 @@ import { fetchCatalog } from "./gateway";
 import { validateTask } from "./rules";
 import { Scheduler, CONFLICT_MESSAGE, NOT_FOUND_MESSAGE, type TaskInput } from "./scheduler";
 import { acquireLock, openStore, StoreError, type Store } from "./store";
+import { errText } from "./types";
 
 /** 页面请求 /api/* 用的口令头 */
 export const TOKEN_HEADER = "x-window-warmup-token";
@@ -61,10 +62,6 @@ function json(data: unknown, status = 200, headers: Record<string, string> = {})
     status,
     headers: { "content-type": "application/json; charset=utf-8", ...headers },
   });
-}
-
-function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }
 
 const MIME: Record<string, string> = {
@@ -236,6 +233,24 @@ export async function startService(opts: ServiceOptions): Promise<ServiceHandle>
     return null;
   }
 
+  /** 新建（id 缺省）或全量更新任务：读请求体 → 校验 → 交给调度器 */
+  async function saveTask(
+    req: Request,
+    cors: Record<string, string>,
+    id: string | undefined,
+  ): Promise<Response> {
+    const input = await readBodyChecked(req, cors);
+    if ("error" in input) return input.error;
+    const checked = validateTask(input.value, new Date());
+    if ("error" in checked) return json({ error: checked.error, field: checked.field }, 400, cors);
+    const task: TaskInput = id === undefined ? checked.task : { ...checked.task, id };
+    try {
+      return json(await scheduler!.upsert(task), 200, cors);
+    } catch (e) {
+      return opError(e, cors);
+    }
+  }
+
   async function api(req: Request, url: URL, origin: string | null): Promise<Response> {
     // 每个 API 响应（含错误）都必须带 CORS：magpie 的插件页跑在 sandbox 框架里，
     // origin 是 opaque，浏览器发来的 Origin 是字面量 "null"，对 http://127.0.0.1:port
@@ -250,35 +265,12 @@ export async function startService(opts: ServiceOptions): Promise<ServiceHandle>
         return json({ error: errText(e) }, 502, cors);
       }
     }
-    if (fatal !== null || lockedBy !== null) {
-      const blocked = readonlyBlock(cors);
-      if (blocked) return blocked;
-    }
+    const blocked = readonlyBlock(cors);
+    if (blocked) return blocked;
     const runMatch = /^\/api\/tasks\/([^/]+)\/run$/.exec(path);
     const idMatch = /^\/api\/tasks\/([^/]+)$/.exec(path);
-    if (path === "/api/tasks" && req.method === "POST") {
-      const input = await readBodyChecked(req, cors);
-      if ("error" in input) return input.error;
-      const checked = validateTask(input.value, new Date());
-      if ("error" in checked) return json({ error: checked.error, field: checked.field }, 400, cors);
-      try {
-        return json(await scheduler!.upsert(checked.task as TaskInput), 200, cors);
-      } catch (e) {
-        return opError(e, cors);
-      }
-    }
-    if (idMatch && req.method === "PUT") {
-      const id = decodeURIComponent(idMatch[1]);
-      const input = await readBodyChecked(req, cors);
-      if ("error" in input) return input.error;
-      const checked = validateTask(input.value, new Date());
-      if ("error" in checked) return json({ error: checked.error, field: checked.field }, 400, cors);
-      try {
-        return json(await scheduler!.upsert({ ...checked.task, id } as TaskInput), 200, cors);
-      } catch (e) {
-        return opError(e, cors);
-      }
-    }
+    if (path === "/api/tasks" && req.method === "POST") return saveTask(req, cors, undefined);
+    if (idMatch && req.method === "PUT") return saveTask(req, cors, decodeURIComponent(idMatch[1]));
     if (idMatch && req.method === "DELETE") {
       try {
         await scheduler!.remove(decodeURIComponent(idMatch[1]));

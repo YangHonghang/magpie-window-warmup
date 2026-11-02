@@ -3,9 +3,9 @@
 // 启动前先探测端口：响应带本插件的自标记头（server.ts 所有响应都带 x-window-warmup: 1）
 // → 已有本服务在跑，直接返回 {}（不重开数据目录、不迁移、不报错）；没探测到才真正启动，
 // 端口被别的程序占用时 Bun.serve 仍抛原错误。
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { gatewayBase } from "./gateway";
+import { xdgConfigHome } from "./magpie-files";
 import { alreadyServing, startService, type ServiceHandle } from "./server";
 import { migrateLegacyState } from "./store";
 
@@ -17,8 +17,7 @@ export const DEFAULT_PORT = 3492;
 function defaultDir(env: Record<string, string | undefined> = process.env): string {
   const custom = env.WINDOW_WARMUP_DIR?.trim();
   if (custom) return custom;
-  const xdg = env.XDG_CONFIG_HOME?.trim();
-  return join(xdg || join(homedir(), ".config"), "magpie", "window-warmup");
+  return join(xdgConfigHome(env), "magpie", "window-warmup");
 }
 
 /** 端口 → 启动中的服务；按端口分键，端口改了旧实例也不串 */

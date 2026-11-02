@@ -3,10 +3,10 @@
 // - service.lock 用原子排他创建（link）+ pid 活性判断：持有者存活则不启动，确认已死才接管；
 //   活性不明（内容读不出/解析不了）一律不抢占。
 import { link, mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { Run, Task } from "./types";
+import { xdgConfigHome } from "./magpie-files";
+import { errText, type Run, type Task } from "./types";
 
 /** 每个任务保留的执行记录上限（超出丢最旧的） */
 const RUNS_PER_TASK = 50;
@@ -47,10 +47,6 @@ export interface Store {
   readonly data: StateFile;
   /** 全量原子写入；并发调用在内部串行化，总是把最新内存状态写进文件 */
   save(): Promise<void>;
-}
-
-function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }
 
 function isStr(x: unknown): x is string {
@@ -254,8 +250,7 @@ export async function migrateLegacyState(
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") return;
   }
-  const xdg = env.XDG_CONFIG_HOME?.trim();
-  const legacy = join(xdg || join(homedir(), ".config"), "magpie", LEGACY_DIR_NAME, STATE_FILE);
+  const legacy = join(xdgConfigHome(env), "magpie", LEGACY_DIR_NAME, STATE_FILE);
   let raw: string;
   try {
     raw = await readFile(legacy, "utf8");

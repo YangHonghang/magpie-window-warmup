@@ -1,6 +1,5 @@
 // @bun
 // src/plugin.ts
-import { homedir as homedir3 } from "os";
 import { join as join4 } from "path";
 
 // src/accounts.ts
@@ -165,9 +164,8 @@ var PLUGIN_DIR_TAIL = ["plugins", "node_modules", "magpie-window-warmup", "dist"
 var BROKEN_PROVIDERS_MESSAGE = "Magpie \u7684\u4F9B\u5E94\u5546\u914D\u7F6E\u6587\u4EF6\u8BFB\u4E0D\u51FA\u6765";
 var READ_CACHE_MS = 5000;
 function magpieDirs(env = process.env, moduleDir = import.meta.dir, p = path) {
-  const home = homedir();
-  const installConfig = p.resolve(rooted(env.XDG_CONFIG_HOME, p) ?? p.join(home, ".config"), "magpie");
-  const installCache = p.resolve(rooted(env.XDG_CACHE_HOME, p) ?? p.join(home, ".cache"), "magpie");
+  const installConfig = p.resolve(xdgConfigHome(env, p), "magpie");
+  const installCache = p.resolve(rooted(env.XDG_CACHE_HOME, p) ?? p.join(homedir(), ".cache"), "magpie");
   const segments = moduleDir.split(p.sep === "\\" ? /[\\/]/ : p.sep).filter((s) => s !== "");
   const tail = segments.slice(-PLUGIN_DIR_TAIL.length);
   const installed = tail.length === PLUGIN_DIR_TAIL.length && PLUGIN_DIR_TAIL.every((seg, i) => tail[i] === seg);
@@ -182,6 +180,15 @@ function magpieDirs(env = process.env, moduleDir = import.meta.dir, p = path) {
 function rooted(v, p) {
   const t = v?.trim();
   return t && p.isAbsolute(t) ? t : null;
+}
+function xdgConfigHome(env = process.env, p = path) {
+  return rooted(env.XDG_CONFIG_HOME, p) ?? p.join(homedir(), ".config");
+}
+function readDefaultKeyDirectory() {
+  return readKeyDirectory(magpieDirs().config).catch(() => null);
+}
+function readDefaultModelCache(providerId) {
+  return readModelCache(magpieDirs().cache, providerId);
 }
 function keyFingerprint(key) {
   return createHash("sha256").update(key, "utf8").digest("hex").slice(0, 10);
@@ -316,349 +323,11 @@ function readModelCache(cacheDir, providerId) {
   }, (v) => v !== null);
 }
 
-// src/gateway.ts
-var DEFAULT_GATEWAY = "http://127.0.0.1:3425";
-var SEND_MAX_TOKENS = 16;
-var SEND_TIMEOUT_MS = 30000;
-var READ_TIMEOUT_MS = 1e4;
-var FULL_QUOTAS_TIMEOUT_MS = 15000;
-var CARD_REFRESH_TIMEOUT_MS = 35000;
-var MIN_FULL_GAP_MS = 5 * 60000;
-var REASON_MAX = 200;
-function timeoutReason(timeoutMs) {
-  const duration = timeoutMs % 1000 === 0 ? `${timeoutMs / 1000} \u79D2` : `${timeoutMs} \u6BEB\u79D2`;
-  return `${duration}\u5185\u6CA1\u6709\u7ED3\u679C\uFF0C\u53EF\u80FD\u5DF2\u53D1\u9001`;
-}
-function gatewayBase(env = process.env) {
-  const addr = env.MAGPIE_ADDR?.trim().replace(/\/+$/, "");
-  if (!addr)
-    return DEFAULT_GATEWAY;
-  if (/^https?:\/\//.test(addr))
-    return addr;
-  return `http://${addr}`;
-}
-var KNOWN_EFFORT_RANK = {
-  minimal: 0,
-  low: 1,
-  medium: 2,
-  high: 3,
-  xhigh: 4,
-  max: 5
-};
-function normalizeLevel(s) {
-  const t = s.trim();
-  const low = t.toLowerCase();
-  if (low === "disabled" || low === "off")
-    return "none";
-  return t;
-}
-function levelList(model) {
-  const raw = model.reasoning_levels;
-  if (raw !== undefined && raw !== null) {
-    if (!Array.isArray(raw))
-      return { error: "\u6A21\u578B\u7684\u601D\u8003\u6863\u4F4D\u6570\u636E\u65E0\u6CD5\u8BC6\u522B" };
-    const list = raw.filter((s) => typeof s === "string");
-    if (raw.length > 0 && list.length === 0)
-      return { error: "\u6A21\u578B\u7684\u601D\u8003\u6863\u4F4D\u6570\u636E\u65E0\u6CD5\u8BC6\u522B" };
-    return list;
-  }
-  const supported = model.supported_reasoning_levels;
-  if (supported !== undefined && supported !== null) {
-    if (!Array.isArray(supported))
-      return { error: "\u6A21\u578B\u7684\u601D\u8003\u6863\u4F4D\u6570\u636E\u65E0\u6CD5\u8BC6\u522B" };
-    const list = supported.map((x) => typeof x === "object" && x !== null ? x.effort : null).filter((s) => typeof s === "string");
-    if (supported.length > 0 && list.length === 0)
-      return { error: "\u6A21\u578B\u7684\u601D\u8003\u6863\u4F4D\u6570\u636E\u65E0\u6CD5\u8BC6\u522B" };
-    return list;
-  }
-  return [];
-}
-function pickEffort(model) {
-  const levels = levelList(model);
-  if ("error" in levels)
-    return levels;
-  if (!model.reasoning || levels.length === 0) {
-    return { send: null, label: "\u4E0D\u9002\u7528" };
-  }
-  const normalized = levels.map(normalizeLevel).filter((s) => s !== "");
-  if (normalized.length === 0)
-    return { send: null, label: "\u4E0D\u9002\u7528" };
-  if (normalized.some((s) => s.toLowerCase() === "none")) {
-    return { send: "none", label: "\u5173\u95ED\uFF08\u6A21\u578B\u652F\u6301\u5173\u95ED\uFF09" };
-  }
-  const decorated = normalized.map((s, i) => {
-    if (/^\d+$/.test(s))
-      return { s, group: 0, rank: Number(s), i };
-    const known = KNOWN_EFFORT_RANK[s.toLowerCase()];
-    return { s, group: known === undefined ? 2 : 1, rank: known ?? i, i };
-  });
-  decorated.sort((a, b) => a.group - b.group || a.rank - b.rank || a.i - b.i);
-  const lowest = decorated[0].s;
-  const allUnknown = decorated.every((d) => d.group === 2);
-  return {
-    send: lowest,
-    label: allUnknown ? `${lowest}\uFF08\u6309\u6A21\u578B\u5217\u8868\u7B2C\u4E00\u6863\uFF09` : `${lowest}\uFF08\u6A21\u578B\u5FC5\u987B\u601D\u8003\uFF0C\u5DF2\u7528\u6700\u4F4E\u6863\uFF09`
-  };
-}
-function errorReason(text) {
-  try {
-    const parsed = JSON.parse(text);
-    const msg = parsed?.error?.message;
-    if (typeof msg === "string" && msg.trim())
-      return msg.trim().slice(0, REASON_MAX);
-  } catch {}
-  return text.trim().slice(0, REASON_MAX) || "\u4E0A\u6E38\u672A\u8FD4\u56DE\u9519\u8BEF\u8BF4\u660E";
-}
-function errText(e) {
-  return e instanceof Error ? e.message : String(e);
-}
-async function requestJSON(base, path, signal, timeoutMs = READ_TIMEOUT_MS, method = "GET") {
-  const timeout = AbortSignal.timeout(timeoutMs);
-  const res = await fetch(base + path, {
-    method,
-    signal: signal ? AbortSignal.any([signal, timeout]) : timeout
-  });
-  const text = await res.text().catch(() => "");
-  if (!res.ok)
-    throw new Error(`HTTP ${res.status}\uFF1A${errorReason(text)}`);
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(`Magpie \u8FD4\u56DE\u7684\u4E0D\u662F JSON\uFF08${path}\uFF09`);
-  }
-}
-function dataArray(data) {
-  if (Array.isArray(data))
-    return data;
-  if (typeof data === "object" && data !== null && Array.isArray(data.data)) {
-    return data.data;
-  }
-  return [];
-}
-function coerceWindows(list) {
-  const out = [];
-  for (const w of Array.isArray(list) ? list : []) {
-    const raw = typeof w === "object" && w !== null ? w : {};
-    if (raw.unlimited === true)
-      continue;
-    out.push({
-      name: typeof raw.name === "string" ? raw.name : "",
-      used: typeof raw.used === "number" ? raw.used : null,
-      resetsAt: typeof raw.resetsAt === "string" ? raw.resetsAt : null
-    });
-  }
-  return out;
-}
-function parseQuotas(data) {
-  const entries = [];
-  for (const item of dataArray(data)) {
-    if (typeof item !== "object" || item === null)
-      continue;
-    const q = item;
-    const rawProvider = typeof q.provider === "string" ? q.provider : "";
-    const viaKey = rawProvider.endsWith("/~keys");
-    const provider = viaKey ? rawProvider.slice(0, -"/~keys".length) : rawProvider;
-    const user = typeof q.user === "string" ? q.user : "";
-    if (!provider || !user)
-      continue;
-    const readAt = typeof q.readAt === "string" && q.readAt ? q.readAt : null;
-    entries.push({
-      provider,
-      account: user,
-      label: typeof q.name === "string" && q.name ? q.name : user,
-      windows: coerceWindows(q.windows),
-      viaKey,
-      ...readAt ? { readAt } : {}
-    });
-  }
-  return entries;
-}
-function createQuotaReader(opts = {}) {
-  const nowFn = opts.now ?? (() => new Date);
-  const lastGood = new Map;
-  const lastAttempt = new Map;
-  const inflight = new Map;
-  return async (base) => {
-    const kept = parseQuotas(await requestJSON(base, "/v1/magpie/quotas?kept=1"));
-    if (kept.length > 0)
-      return { at: nowFn(), entries: kept };
-    let pending = inflight.get(base);
-    if (!pending) {
-      const now = nowFn().getTime();
-      const attempted = lastAttempt.get(base);
-      if (attempted !== undefined && now - attempted < MIN_FULL_GAP_MS) {
-        return lastGood.get(base) ?? { at: nowFn(), entries: [] };
-      }
-      lastAttempt.set(base, now);
-      pending = requestJSON(base, "/v1/magpie/quotas", undefined, FULL_QUOTAS_TIMEOUT_MS).then((data) => {
-        const fresh = { at: nowFn(), entries: parseQuotas(data) };
-        lastGood.set(base, fresh);
-        return fresh;
-      }).finally(() => {
-        inflight.delete(base);
-      });
-      inflight.set(base, pending);
-    }
-    return pending;
-  };
-}
-async function refreshQuotaCard(base, provider, user) {
-  const q = new URLSearchParams({ provider, user });
-  await requestJSON(base, `/v1/magpie/quotas/refresh?${q}`, undefined, CARD_REFRESH_TIMEOUT_MS, "POST");
-}
-var fetchQuotas = createQuotaReader();
-async function fetchModels(base, signal) {
-  const data = await requestJSON(base, "/v1/models", signal);
-  const out = [];
-  for (const item of dataArray(data)) {
-    if (typeof item !== "object" || item === null)
-      continue;
-    const m = item;
-    if (typeof m.id !== "string" || !m.id || m.id.startsWith("group/"))
-      continue;
-    out.push(m);
-  }
-  return out;
-}
-function modelProvider(m) {
-  const owner = typeof m.owned_by === "string" ? m.owned_by.trim() : "";
-  return owner || (m.id.includes("/") ? m.id.slice(0, m.id.indexOf("/")) : "");
-}
-async function fetchCatalog(base) {
-  const [modelsData, quotas] = await Promise.all([
-    requestJSON(base, "/v1/models"),
-    fetchQuotas(base).catch(() => ({ at: new Date, entries: [] }))
-  ]);
-  const providers = new Map;
-  const rawModels = new Map;
-  const ensure = (id) => {
-    let p = providers.get(id);
-    if (!p) {
-      p = { id, accounts: [], models: [], autoAccountModels: null, autoModel: null };
-      providers.set(id, p);
-    }
-    return p;
-  };
-  for (const item of dataArray(modelsData)) {
-    if (typeof item !== "object" || item === null)
-      continue;
-    const m = item;
-    if (typeof m.id !== "string" || !m.id || m.id.startsWith("group/"))
-      continue;
-    const pid = modelProvider(m);
-    if (!pid)
-      continue;
-    ensure(pid);
-    const raws = rawModels.get(pid);
-    if (raws)
-      raws.push(m);
-    else
-      rawModels.set(pid, [m]);
-  }
-  for (const q of quotas.entries)
-    ensure(q.provider);
-  const dirs = magpieDirs();
-  const keyDir = await readKeyDirectory(dirs.config).catch(() => null);
-  const caches = new Map;
-  const cacheOf = async (pid) => {
-    let c = caches.get(pid);
-    if (c === undefined) {
-      c = await readModelCache(dirs.cache, pid);
-      caches.set(pid, c);
-    }
-    return c;
-  };
-  const list = [...providers.values()];
-  for (const p of list) {
-    const raws = rawModels.get(p.id) ?? [];
-    p.models = raws.map((m) => ({ id: m.id, effort: pickEffort(m) })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-    const built = accountsOf(p.id, {
-      models: raws.map((m) => m.id),
-      quotas: quotas.entries,
-      keyDir,
-      cache: await cacheOf(p.id)
-    });
-    p.accounts = built.accounts;
-    p.autoAccountModels = built.autoAccountModels;
-    p.autoModel = built.autoAccountModels ? pickAutoModel(built.autoAccountModels.map((id) => ({ id })))?.id ?? null : null;
-  }
-  list.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-  return { providers: list };
-}
-function usableChatBody(text) {
-  try {
-    const parsed = JSON.parse(text);
-    return typeof parsed === "object" && parsed !== null;
-  } catch {
-    return false;
-  }
-}
-var WARMUP_MESSAGE = "hi";
-async function send(base, task, pin, effort, signal, timeoutMs = SEND_TIMEOUT_MS) {
-  const startedAt = Date.now();
-  const elapsed = () => Date.now() - startedAt;
-  const timer = AbortSignal.timeout(timeoutMs);
-  const combined = AbortSignal.any([signal, timer]);
-  const headers = {
-    "content-type": "application/json",
-    "x-magpie-session": `window-warmup/${task.id}`
-  };
-  if (pin) {
-    headers["x-magpie-account"] = /[^\x00-\x7F]/.test(pin) ? Buffer.from(pin, "utf8").toString("latin1") : pin;
-  }
-  const body = {
-    model: task.model,
-    messages: [{ role: "user", content: WARMUP_MESSAGE }],
-    max_tokens: SEND_MAX_TOKENS,
-    stream: false
-  };
-  if (effort)
-    body.reasoning_effort = effort;
-  let res;
-  try {
-    res = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: combined
-    });
-  } catch (e) {
-    if (signal.aborted)
-      return { outcome: "unknown", reason: "\u53D1\u9001\u88AB\u53D6\u6D88", ms: elapsed() };
-    if (timer.aborted)
-      return { outcome: "unknown", reason: timeoutReason(timeoutMs), ms: elapsed() };
-    const code = e.code;
-    if (code === "ECONNRESET" || code === "EPIPE") {
-      return { outcome: "unknown", reason: "\u8FDE\u63A5\u4E2D\u65AD\uFF0C\u7ED3\u679C\u672A\u77E5\uFF08\u53EF\u80FD\u5DF2\u53D1\u9001\uFF09", ms: elapsed() };
-    }
-    return { outcome: "failed", reason: errText(e), ms: elapsed() };
-  }
-  let text = "";
-  let bodyBroken = false;
-  try {
-    text = await res.text();
-  } catch {
-    bodyBroken = true;
-    if (signal.aborted)
-      return { outcome: "unknown", reason: "\u53D1\u9001\u88AB\u53D6\u6D88", ms: elapsed() };
-    if (timer.aborted)
-      return { outcome: "unknown", reason: timeoutReason(timeoutMs), ms: elapsed() };
-  }
-  if (res.ok) {
-    return !bodyBroken && usableChatBody(text) ? { outcome: "ok", reason: "", ms: elapsed() } : { outcome: "unknown", reason: `HTTP ${res.status}\uFF0C\u54CD\u5E94\u4F53\u8BFB\u53D6\u5931\u8D25\uFF0C\u7ED3\u679C\u672A\u77E5`, ms: elapsed() };
-  }
-  return { outcome: "failed", reason: `HTTP ${res.status}\uFF1A${errorReason(text)}`, ms: elapsed() };
-}
-
-// src/server.ts
-import { randomBytes, timingSafeEqual } from "crypto";
-import { readFile as readFile3 } from "fs/promises";
-import path2, { basename, extname, join as join3, resolve as resolve2 } from "path";
-
 // src/rules.ts
 var MINUTE_MS = 60000;
 var HOUR_MS = 3600000;
 var RESET_GRACE_MS = 30000;
+var WARMUP_MESSAGE = "hi";
 var LAST_DUE_LOOKBACK_MS = 48 * HOUR_MS;
 var NAME_MAX = 40;
 var formatters = new Map;
@@ -944,6 +613,331 @@ function validateTask(input, now) {
   return { task: { name, enabled, provider, account, model, message, trigger } };
 }
 
+// src/types.ts
+function errText(e) {
+  return e instanceof Error ? e.message : String(e);
+}
+
+// src/gateway.ts
+var DEFAULT_GATEWAY = "http://127.0.0.1:3425";
+var SEND_MAX_TOKENS = 16;
+var SEND_TIMEOUT_MS = 30000;
+var READ_TIMEOUT_MS = 1e4;
+var FULL_QUOTAS_TIMEOUT_MS = 15000;
+var CARD_REFRESH_TIMEOUT_MS = 35000;
+var MIN_FULL_GAP_MS = 5 * 60000;
+var REASON_MAX = 200;
+function timeoutReason(timeoutMs) {
+  const duration = timeoutMs % 1000 === 0 ? `${timeoutMs / 1000} \u79D2` : `${timeoutMs} \u6BEB\u79D2`;
+  return `${duration}\u5185\u6CA1\u6709\u7ED3\u679C\uFF0C\u53EF\u80FD\u5DF2\u53D1\u9001`;
+}
+function gatewayBase(env = process.env) {
+  const addr = env.MAGPIE_ADDR?.trim().replace(/\/+$/, "");
+  if (!addr)
+    return DEFAULT_GATEWAY;
+  if (/^https?:\/\//.test(addr))
+    return addr;
+  return `http://${addr}`;
+}
+var KNOWN_EFFORT_RANK = {
+  minimal: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+  xhigh: 4,
+  max: 5
+};
+function normalizeLevel(s) {
+  const t = s.trim();
+  const low = t.toLowerCase();
+  if (low === "disabled" || low === "off")
+    return "none";
+  return t;
+}
+function levelList(model) {
+  const raw = model.reasoning_levels;
+  if (raw !== undefined && raw !== null) {
+    if (!Array.isArray(raw))
+      return { error: "\u6A21\u578B\u7684\u601D\u8003\u6863\u4F4D\u6570\u636E\u65E0\u6CD5\u8BC6\u522B" };
+    const list = raw.filter((s) => typeof s === "string");
+    if (raw.length > 0 && list.length === 0)
+      return { error: "\u6A21\u578B\u7684\u601D\u8003\u6863\u4F4D\u6570\u636E\u65E0\u6CD5\u8BC6\u522B" };
+    return list;
+  }
+  const supported = model.supported_reasoning_levels;
+  if (supported !== undefined && supported !== null) {
+    if (!Array.isArray(supported))
+      return { error: "\u6A21\u578B\u7684\u601D\u8003\u6863\u4F4D\u6570\u636E\u65E0\u6CD5\u8BC6\u522B" };
+    const list = supported.map((x) => typeof x === "object" && x !== null ? x.effort : null).filter((s) => typeof s === "string");
+    if (supported.length > 0 && list.length === 0)
+      return { error: "\u6A21\u578B\u7684\u601D\u8003\u6863\u4F4D\u6570\u636E\u65E0\u6CD5\u8BC6\u522B" };
+    return list;
+  }
+  return [];
+}
+function pickEffort(model) {
+  const levels = levelList(model);
+  if ("error" in levels)
+    return levels;
+  if (!model.reasoning || levels.length === 0) {
+    return { send: null, label: "\u4E0D\u9002\u7528" };
+  }
+  const normalized = levels.map(normalizeLevel).filter((s) => s !== "");
+  if (normalized.length === 0)
+    return { send: null, label: "\u4E0D\u9002\u7528" };
+  if (normalized.some((s) => s.toLowerCase() === "none")) {
+    return { send: "none", label: "\u5173\u95ED\uFF08\u6A21\u578B\u652F\u6301\u5173\u95ED\uFF09" };
+  }
+  const decorated = normalized.map((s, i) => {
+    if (/^\d+$/.test(s))
+      return { s, group: 0, rank: Number(s), i };
+    const known = KNOWN_EFFORT_RANK[s.toLowerCase()];
+    return { s, group: known === undefined ? 2 : 1, rank: known ?? i, i };
+  });
+  decorated.sort((a, b) => a.group - b.group || a.rank - b.rank || a.i - b.i);
+  const lowest = decorated[0].s;
+  const allUnknown = decorated.every((d) => d.group === 2);
+  return {
+    send: lowest,
+    label: allUnknown ? `${lowest}\uFF08\u6309\u6A21\u578B\u5217\u8868\u7B2C\u4E00\u6863\uFF09` : `${lowest}\uFF08\u6A21\u578B\u5FC5\u987B\u601D\u8003\uFF0C\u5DF2\u7528\u6700\u4F4E\u6863\uFF09`
+  };
+}
+function errorReason(text) {
+  try {
+    const parsed = JSON.parse(text);
+    const msg = parsed?.error?.message;
+    if (typeof msg === "string" && msg.trim())
+      return msg.trim().slice(0, REASON_MAX);
+  } catch {}
+  return text.trim().slice(0, REASON_MAX) || "\u4E0A\u6E38\u672A\u8FD4\u56DE\u9519\u8BEF\u8BF4\u660E";
+}
+async function requestJSON(base, path, signal, timeoutMs = READ_TIMEOUT_MS, method = "GET") {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const res = await fetch(base + path, {
+    method,
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout
+  });
+  const text = await res.text().catch(() => "");
+  if (!res.ok)
+    throw new Error(`HTTP ${res.status}\uFF1A${errorReason(text)}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Magpie \u8FD4\u56DE\u7684\u4E0D\u662F JSON\uFF08${path}\uFF09`);
+  }
+}
+function dataArray(data) {
+  if (Array.isArray(data))
+    return data;
+  if (typeof data === "object" && data !== null && Array.isArray(data.data)) {
+    return data.data;
+  }
+  return [];
+}
+function coerceWindows(list) {
+  const out = [];
+  for (const w of Array.isArray(list) ? list : []) {
+    const raw = typeof w === "object" && w !== null ? w : {};
+    if (raw.unlimited === true)
+      continue;
+    out.push({
+      name: typeof raw.name === "string" ? raw.name : "",
+      used: typeof raw.used === "number" ? raw.used : null,
+      resetsAt: typeof raw.resetsAt === "string" ? raw.resetsAt : null
+    });
+  }
+  return out;
+}
+function parseQuotas(data) {
+  const entries = [];
+  for (const item of dataArray(data)) {
+    if (typeof item !== "object" || item === null)
+      continue;
+    const q = item;
+    const rawProvider = typeof q.provider === "string" ? q.provider : "";
+    const viaKey = rawProvider.endsWith("/~keys");
+    const provider = viaKey ? rawProvider.slice(0, -"/~keys".length) : rawProvider;
+    const user = typeof q.user === "string" ? q.user : "";
+    if (!provider || !user)
+      continue;
+    const readAt = typeof q.readAt === "string" && q.readAt ? q.readAt : null;
+    entries.push({
+      provider,
+      account: user,
+      label: typeof q.name === "string" && q.name ? q.name : user,
+      windows: coerceWindows(q.windows),
+      viaKey,
+      ...readAt ? { readAt } : {}
+    });
+  }
+  return entries;
+}
+function createQuotaReader(opts = {}) {
+  const nowFn = opts.now ?? (() => new Date);
+  const lastGood = new Map;
+  const lastAttempt = new Map;
+  const inflight = new Map;
+  return async (base) => {
+    const kept = parseQuotas(await requestJSON(base, "/v1/magpie/quotas?kept=1"));
+    if (kept.length > 0)
+      return { at: nowFn(), entries: kept };
+    let pending = inflight.get(base);
+    if (!pending) {
+      const now = nowFn().getTime();
+      const attempted = lastAttempt.get(base);
+      if (attempted !== undefined && now - attempted < MIN_FULL_GAP_MS) {
+        return lastGood.get(base) ?? { at: nowFn(), entries: [] };
+      }
+      lastAttempt.set(base, now);
+      pending = requestJSON(base, "/v1/magpie/quotas", undefined, FULL_QUOTAS_TIMEOUT_MS).then((data) => {
+        const fresh = { at: nowFn(), entries: parseQuotas(data) };
+        lastGood.set(base, fresh);
+        return fresh;
+      }).finally(() => {
+        inflight.delete(base);
+      });
+      inflight.set(base, pending);
+    }
+    return pending;
+  };
+}
+async function refreshQuotaCard(base, provider, user) {
+  const q = new URLSearchParams({ provider, user });
+  await requestJSON(base, `/v1/magpie/quotas/refresh?${q}`, undefined, CARD_REFRESH_TIMEOUT_MS, "POST");
+}
+var fetchQuotas = createQuotaReader();
+async function fetchModels(base, signal) {
+  const data = await requestJSON(base, "/v1/models", signal);
+  const out = [];
+  for (const item of dataArray(data)) {
+    if (typeof item !== "object" || item === null)
+      continue;
+    const m = item;
+    if (typeof m.id !== "string" || !m.id || m.id.startsWith("group/"))
+      continue;
+    out.push(m);
+  }
+  return out;
+}
+function modelProvider(m) {
+  const owner = typeof m.owned_by === "string" ? m.owned_by.trim() : "";
+  return owner || (m.id.includes("/") ? m.id.slice(0, m.id.indexOf("/")) : "");
+}
+async function fetchCatalog(base) {
+  const [models, quotas] = await Promise.all([
+    fetchModels(base),
+    fetchQuotas(base).catch(() => ({ at: new Date, entries: [] }))
+  ]);
+  const providers = new Map;
+  const rawModels = new Map;
+  const ensure = (id) => {
+    let p = providers.get(id);
+    if (!p) {
+      p = { id, accounts: [], models: [], autoAccountModels: null, autoModel: null };
+      providers.set(id, p);
+    }
+    return p;
+  };
+  for (const m of models) {
+    const pid = modelProvider(m);
+    if (!pid)
+      continue;
+    ensure(pid);
+    const raws = rawModels.get(pid);
+    if (raws)
+      raws.push(m);
+    else
+      rawModels.set(pid, [m]);
+  }
+  for (const q of quotas.entries)
+    ensure(q.provider);
+  const keyDir = await readDefaultKeyDirectory();
+  const list = [...providers.values()];
+  for (const p of list) {
+    const raws = rawModels.get(p.id) ?? [];
+    p.models = raws.map((m) => ({ id: m.id, effort: pickEffort(m) })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    const built = accountsOf(p.id, {
+      models: raws.map((m) => m.id),
+      quotas: quotas.entries,
+      keyDir,
+      cache: await readDefaultModelCache(p.id)
+    });
+    p.accounts = built.accounts;
+    p.autoAccountModels = built.autoAccountModels;
+    p.autoModel = built.autoAccountModels ? pickAutoModel(built.autoAccountModels.map((id) => ({ id })))?.id ?? null : null;
+  }
+  list.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  return { providers: list };
+}
+function usableChatBody(text) {
+  try {
+    const parsed = JSON.parse(text);
+    return typeof parsed === "object" && parsed !== null;
+  } catch {
+    return false;
+  }
+}
+async function send(base, task, pin, effort, signal, timeoutMs = SEND_TIMEOUT_MS) {
+  const startedAt = Date.now();
+  const elapsed = () => Date.now() - startedAt;
+  const timer = AbortSignal.timeout(timeoutMs);
+  const combined = AbortSignal.any([signal, timer]);
+  const headers = {
+    "content-type": "application/json",
+    "x-magpie-session": `window-warmup/${task.id}`
+  };
+  if (pin) {
+    headers["x-magpie-account"] = /[^\x00-\x7F]/.test(pin) ? Buffer.from(pin, "utf8").toString("latin1") : pin;
+  }
+  const body = {
+    model: task.model,
+    messages: [{ role: "user", content: WARMUP_MESSAGE }],
+    max_tokens: SEND_MAX_TOKENS,
+    stream: false
+  };
+  if (effort)
+    body.reasoning_effort = effort;
+  let res;
+  try {
+    res = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: combined
+    });
+  } catch (e) {
+    if (signal.aborted)
+      return { outcome: "unknown", reason: "\u53D1\u9001\u88AB\u53D6\u6D88", ms: elapsed() };
+    if (timer.aborted)
+      return { outcome: "unknown", reason: timeoutReason(timeoutMs), ms: elapsed() };
+    const code = e.code;
+    if (code === "ECONNRESET" || code === "EPIPE") {
+      return { outcome: "unknown", reason: "\u8FDE\u63A5\u4E2D\u65AD\uFF0C\u7ED3\u679C\u672A\u77E5\uFF08\u53EF\u80FD\u5DF2\u53D1\u9001\uFF09", ms: elapsed() };
+    }
+    return { outcome: "failed", reason: errText(e), ms: elapsed() };
+  }
+  let text = "";
+  let bodyBroken = false;
+  try {
+    text = await res.text();
+  } catch {
+    bodyBroken = true;
+    if (signal.aborted)
+      return { outcome: "unknown", reason: "\u53D1\u9001\u88AB\u53D6\u6D88", ms: elapsed() };
+    if (timer.aborted)
+      return { outcome: "unknown", reason: timeoutReason(timeoutMs), ms: elapsed() };
+  }
+  if (res.ok) {
+    return !bodyBroken && usableChatBody(text) ? { outcome: "ok", reason: "", ms: elapsed() } : { outcome: "unknown", reason: `HTTP ${res.status}\uFF0C\u54CD\u5E94\u4F53\u8BFB\u53D6\u5931\u8D25\uFF0C\u7ED3\u679C\u672A\u77E5`, ms: elapsed() };
+  }
+  return { outcome: "failed", reason: `HTTP ${res.status}\uFF1A${errorReason(text)}`, ms: elapsed() };
+}
+
+// src/server.ts
+import { randomBytes, timingSafeEqual } from "crypto";
+import { readFile as readFile3 } from "fs/promises";
+import path2, { basename, extname, join as join3, resolve as resolve2 } from "path";
+
 // src/scheduler.ts
 import { randomUUID } from "crypto";
 var TIMER_CAP_MS = 600000;
@@ -959,8 +953,32 @@ var DISABLED_REASON = "\u4EFB\u52A1\u5DF2\u505C\u7528\uFF0C\u53D1\u9001\u88AB\u5
 var DELETED_REASON = "\u4EFB\u52A1\u5DF2\u5220\u9664\uFF0C\u53D1\u9001\u88AB\u53D6\u6D88";
 var CONFLICT_MESSAGE = "\u4E0A\u4E00\u6B21\u53D1\u9001\u8FD8\u6CA1\u7ED3\u675F\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5";
 var NOT_FOUND_MESSAGE = "\u4EFB\u52A1\u4E0D\u5B58\u5728";
-function errText2(e) {
-  return e instanceof Error ? e.message : String(e);
+function taskContent(input) {
+  return {
+    name: input.name,
+    enabled: input.enabled,
+    provider: input.provider,
+    account: input.account,
+    model: input.model,
+    message: input.message,
+    trigger: input.trigger
+  };
+}
+function newRun(task, at, due, source, resetKey) {
+  return {
+    id: randomUUID(),
+    taskId: task.id,
+    source,
+    due: due?.toISOString() ?? null,
+    startedAt: at.toISOString(),
+    endedAt: null,
+    outcome: "running",
+    reason: "",
+    effort: null,
+    model: null,
+    ms: null,
+    resetKey
+  };
 }
 
 class Scheduler {
@@ -1000,9 +1018,8 @@ class Scheduler {
     this.quotasFn = deps.quotasFn ?? fetchQuotas;
     this.refreshCardFn = deps.refreshCardFn ?? refreshQuotaCard;
     this.modelsFn = deps.modelsFn ?? fetchModels;
-    const dirs = magpieDirs();
-    this.keyDirFn = deps.keyDirFn ?? (() => readKeyDirectory(dirs.config).catch(() => null));
-    this.modelCacheFn = deps.modelCacheFn ?? ((pid) => readModelCache(dirs.cache, pid));
+    this.keyDirFn = deps.keyDirFn ?? readDefaultKeyDirectory;
+    this.modelCacheFn = deps.modelCacheFn ?? readDefaultModelCache;
   }
   start() {
     this.started = true;
@@ -1038,13 +1055,7 @@ class Scheduler {
         const prev = this.store.data.tasks[idx];
         const next = {
           id: prev.id,
-          name: input.name,
-          enabled: input.enabled,
-          provider: input.provider,
-          account: input.account,
-          model: input.model,
-          message: input.message,
-          trigger: input.trigger,
+          ...taskContent(input),
           createdAt: prev.createdAt,
           updatedAt: now.toISOString()
         };
@@ -1061,13 +1072,7 @@ class Scheduler {
       }
       const task = {
         id: randomUUID(),
-        name: input.name,
-        enabled: input.enabled,
-        provider: input.provider,
-        account: input.account,
-        model: input.model,
-        message: input.message,
-        trigger: input.trigger,
+        ...taskContent(input),
         createdAt: now.toISOString(),
         updatedAt: now.toISOString()
       };
@@ -1136,26 +1141,20 @@ class Scheduler {
   }
   snapshotTask(task, now, next, points) {
     if (task.trigger.kind === "window") {
-      const info = this.windowInfo(task, now);
+      const due = this.currentWindowDue(task, now);
       let at = null;
-      if (info && !("error" in info)) {
-        const tried = this.marksOf(task.id).resetKeys.includes(info.resetKey);
-        if (info.at.getTime() > now.getTime()) {
-          at = tried ? null : info.at;
-        } else if (!tried) {
+      if (due && !this.tried(task, due)) {
+        if (due.at.getTime() > now.getTime())
+          at = due.at;
+        else
           at = this.snapshotFresh(now) ? now : new Date(now.getTime() + QUOTA_REFRESH_MS);
-        }
       }
       next[task.id] = at ? at.toISOString() : null;
       if (at && at.getTime() > now.getTime() && at.getTime() <= now.getTime() + DAY_MS) {
         points.push({ taskId: task.id, at: at.toISOString() });
       }
     } else {
-      const marks = this.store.data.marks[task.id];
-      const lastMark = marks?.lastDue ? new Date(marks.lastDue) : null;
-      const recent = lastDue(task.trigger, now);
-      const pendingCatchup = recent !== null && (!lastMark || recent.getTime() > lastMark.getTime()) && recent.getTime() > new Date(task.updatedAt).getTime() ? recent : null;
-      const base = pendingCatchup ?? now;
+      const base = this.pendingFixedDue(task, now) ?? now;
       const at = task.trigger.kind === "daily" ? nextDaily(task.trigger, base) : nextEvery(task.trigger, base);
       next[task.id] = at.toISOString();
       for (const p of upcoming(task.trigger, now, 25)) {
@@ -1197,7 +1196,7 @@ class Scheduler {
       this.saveError = null;
       return true;
     }, (e) => {
-      this.saveError = errText2(e);
+      this.saveError = errText(e);
       return false;
     });
     this.lastWrite = p.then(() => {});
@@ -1233,7 +1232,7 @@ class Scheduler {
         else
           await this.evaluateFixed(task, now);
       } catch (e) {
-        const reason = `\u8C03\u5EA6\u51FA\u9519\uFF1A${errText2(e)}`;
+        const reason = `\u8C03\u5EA6\u51FA\u9519\uFF1A${errText(e)}`;
         const key = `${hourFloorISO(now)}|${reason}`;
         if (this.lastErrKey.get(task.id) !== key) {
           this.lastErrKey.set(task.id, key);
@@ -1245,72 +1244,81 @@ class Scheduler {
       await this.refreshQuotas();
     this.rearm();
   }
-  async evaluateFixed(task, now) {
-    const marks = this.marksOf(task.id);
-    const lastMark = marks.lastDue ? new Date(marks.lastDue) : null;
+  fixedConsumedUntil(task) {
+    const last = this.store.data.marks[task.id]?.lastDue;
+    const updated = new Date(task.updatedAt).getTime();
+    return last ? Math.max(new Date(last).getTime(), updated) : updated;
+  }
+  pendingFixedDue(task, now) {
     const recent = lastDue(task.trigger, now);
-    if (!recent)
-      return;
-    const pending = (!lastMark || recent.getTime() > lastMark.getTime()) && recent.getTime() > new Date(task.updatedAt).getTime();
-    if (!pending)
+    return recent && recent.getTime() > this.fixedConsumedUntil(task) ? recent : null;
+  }
+  async evaluateFixed(task, now) {
+    const due = this.pendingFixedDue(task, now);
+    if (!due)
       return;
     const armed = this.armedFor.get(task.id) ?? null;
-    const source = armed !== null && armed.getTime() === recent.getTime() ? "schedule" : "catchup";
-    await this.fire(task, recent, source, null);
+    const source = armed !== null && armed.getTime() === due.getTime() ? "schedule" : "catchup";
+    await this.fire(task, due, source, null);
   }
   async evaluateWindow(task, now) {
+    const due = this.currentWindowDue(task, now);
+    if (!due || !this.windowReady(task, due, now))
+      return;
     const marks = this.marksOf(task.id);
-    const info = this.windowInfo(task, now);
-    if (!info || "error" in info)
-      return;
-    if (info.at.getTime() > now.getTime())
-      return;
-    if (marks.resetKeys.includes(info.resetKey))
-      return;
-    marks.resetKeys.push(info.resetKey);
-    const companion = `idle:${hourFloorISO(info.at)}`;
-    if (companion !== info.resetKey)
+    marks.resetKeys.push(due.resetKey);
+    const companion = `idle:${hourFloorISO(due.at)}`;
+    if (companion !== due.resetKey)
       marks.resetKeys.push(companion);
     this.quotaStale = true;
-    await this.fire(task, info.at, "schedule", info.resetKey);
+    await this.fire(task, due.at, "schedule", due.resetKey);
   }
-  windowInfo(task, now) {
-    if (task.trigger.kind !== "window")
-      return null;
-    const snap = this.quota;
-    if (!snap)
-      return null;
-    if (!task.account)
-      return { at: snap.at, error: "\u7A97\u53E3\u4EFB\u52A1\u6CA1\u6709\u6307\u5B9A\u8D26\u53F7" };
-    const windows = windowsForAccount(task.provider, task.account, snap.entries, this.keyDirMap);
-    if (windows === null)
-      return { at: snap.at, error: `\u989D\u5EA6\u91CC\u6CA1\u6709\u8D26\u53F7 ${task.account}` };
-    const windowName = task.trigger.kind === "window" ? task.trigger.window : "";
-    const win = windows.find((w) => w.name === windowName);
-    const due = windowDue(win, snap.at);
-    if ("error" in due)
-      return { at: snap.at, error: due.error };
-    const raw = win?.resetsAt;
-    const rawValid = !!raw && !Number.isNaN(new Date(raw).getTime());
-    if (raw && rawValid) {
+  tried(task, due) {
+    return this.marksOf(task.id).resetKeys.includes(due.resetKey);
+  }
+  windowReady(task, due, now) {
+    return due.at.getTime() <= now.getTime() && !this.tried(task, due);
+  }
+  quotaWindow(task) {
+    if (task.trigger.kind !== "window" || !this.quota || !task.account)
+      return;
+    const name = task.trigger.window;
+    const windows = windowsForAccount(task.provider, task.account, this.quota.entries, this.keyDirMap);
+    return windows?.find((w) => w.name === name);
+  }
+  recordResets() {
+    let dirty = false;
+    for (const task of this.store.data.tasks) {
+      if (!task.enabled)
+        continue;
+      const raw = this.quotaWindow(task)?.resetsAt;
+      if (!raw || Number.isNaN(new Date(raw).getTime()))
+        continue;
       const mark = this.marksOf(task.id);
       if (mark.lastReset !== raw) {
         mark.lastReset = raw;
-        this.trackSave();
+        dirty = true;
       }
     }
+    if (dirty)
+      this.trackSave();
+  }
+  currentWindowDue(task, now) {
+    const win = this.quotaWindow(task);
+    if (!win || !this.quota)
+      return null;
+    const due = windowDue(win, this.quota.at);
+    if ("error" in due)
+      return null;
     if (due.resetKey.startsWith("idle:") && this.staleIdle(task))
       return null;
-    if (raw && rawValid) {
-      if (due.resetKey.startsWith("idle:")) {
-        return { at: due.at, resetKey: raw };
-      }
-      return due;
+    const raw = win.resetsAt;
+    if (raw && !Number.isNaN(new Date(raw).getTime())) {
+      return { at: due.at, resetKey: raw };
     }
     const mark = this.marksOf(task.id);
-    const last = mark.lastReset;
-    const seenFuture = (last ? new Date(last).getTime() : NaN) > now.getTime() || mark.resetKeys.some((k) => !k.startsWith("idle:") && !k.startsWith("missing:") && !Number.isNaN(new Date(k).getTime()) && new Date(k).getTime() > now.getTime());
-    if (seenFuture)
+    const isFuture = (iso) => !!iso && new Date(iso).getTime() > now.getTime();
+    if (isFuture(mark.lastReset) || mark.resetKeys.some(isFuture))
       return null;
     return due;
   }
@@ -1337,8 +1345,9 @@ class Scheduler {
       const readAt = new Date(card.readAt ?? "").getTime();
       const settled = this.lastSentMs(task) + POST_SEND_SETTLE_MS;
       const afterSend = now.getTime() >= settled && readAt < settled;
-      const info = this.windowInfo(task, now);
-      const dueNow = info !== null && !("error" in info) && info.at.getTime() <= now.getTime() && !this.marksOf(task.id).resetKeys.includes(info.resetKey) && !(now.getTime() - readAt <= CARD_FRESH_MS);
+      const due = this.currentWindowDue(task, now);
+      const readFresh = now.getTime() - readAt <= CARD_FRESH_MS;
+      const dueNow = due !== null && this.windowReady(task, due, now) && !readFresh;
       if (!afterSend && !dueNow)
         continue;
       const key = `${card.provider}|${card.account}`;
@@ -1371,6 +1380,7 @@ class Scheduler {
     } else if (!quotaFresh) {
       this.quotaStale = true;
     }
+    this.recordResets();
   }
   async fire(task, due, source, resetKey) {
     const now = this.nowFn();
@@ -1381,20 +1391,7 @@ class Scheduler {
     }
     if (due && task.trigger.kind !== "window")
       this.marksOf(task.id).lastDue = due.toISOString();
-    const run = {
-      id: randomUUID(),
-      taskId: task.id,
-      source,
-      due: due?.toISOString() ?? null,
-      startedAt: now.toISOString(),
-      endedAt: null,
-      outcome: "running",
-      reason: "",
-      effort: null,
-      model: null,
-      ms: null,
-      resetKey
-    };
+    const run = newRun(task, now, due, source, resetKey);
     this.store.data.runs.push(run);
     const abort = new AbortController;
     const entry = { abort, cancel: null, done: Promise.resolve() };
@@ -1460,7 +1457,7 @@ class Scheduler {
             }
           }
         } catch (e) {
-          result = { outcome: "failed", reason: errText2(e), ms: 0 };
+          result = { outcome: "failed", reason: errText(e), ms: 0 };
         }
       }
       run.effort = effort;
@@ -1490,18 +1487,11 @@ class Scheduler {
   }
   appendFailure(task, at, due, reason, resetKey, source) {
     const run = {
-      id: randomUUID(),
-      taskId: task.id,
-      source,
-      due: due?.toISOString() ?? null,
-      startedAt: at.toISOString(),
+      ...newRun(task, at, due, source, resetKey),
       endedAt: at.toISOString(),
       outcome: "failed",
       reason,
-      effort: null,
-      model: null,
-      ms: 0,
-      resetKey
+      ms: 0
     };
     this.store.data.runs.push(run);
     this.trackSave();
@@ -1515,6 +1505,7 @@ class Scheduler {
     this.armedFor = new Map;
     if (!this.started)
       return;
+    this.recordResets();
     const now = this.nowFn();
     let minDelay = Infinity;
     for (const task of this.store.data.tasks) {
@@ -1524,19 +1515,16 @@ class Scheduler {
         const settled = this.lastSentMs(task) + POST_SEND_SETTLE_MS;
         if (settled > now.getTime())
           minDelay = Math.min(minDelay, settled - now.getTime());
-        const info = this.windowInfo(task, now);
-        if (info && !("error" in info) && info.at.getTime() > now.getTime()) {
-          minDelay = Math.min(minDelay, info.at.getTime() - now.getTime());
-        } else if (info && !("error" in info) && info.at.getTime() <= now.getTime() && !this.marksOf(task.id).resetKeys.includes(info.resetKey) && this.snapshotFresh(now)) {
+        const due = this.currentWindowDue(task, now);
+        if (due && due.at.getTime() > now.getTime()) {
+          minDelay = Math.min(minDelay, due.at.getTime() - now.getTime());
+        } else if (due && this.windowReady(task, due, now) && this.snapshotFresh(now)) {
           minDelay = Math.min(minDelay, 0);
         } else {
           minDelay = Math.min(minDelay, this.quotaTried ? QUOTA_REFRESH_MS : 0);
         }
       } else {
-        const marks = this.store.data.marks[task.id];
-        const lastMark = marks?.lastDue ? new Date(marks.lastDue) : null;
-        const updated = new Date(task.updatedAt);
-        const base = lastMark && lastMark.getTime() > updated.getTime() ? lastMark : updated;
+        const base = new Date(this.fixedConsumedUntil(task));
         let due;
         try {
           due = task.trigger.kind === "daily" ? nextDaily(task.trigger, base) : nextEvery(task.trigger, base);
@@ -1562,7 +1550,6 @@ class Scheduler {
 
 // src/store.ts
 import { link, mkdir, readdir, readFile as readFile2, rename, unlink, writeFile } from "fs/promises";
-import { homedir as homedir2 } from "os";
 import { join as join2 } from "path";
 import { randomUUID as randomUUID2 } from "crypto";
 var RUNS_PER_TASK = 50;
@@ -1576,9 +1563,6 @@ class StoreError extends Error {
     super(message);
     this.name = "StoreError";
   }
-}
-function errText3(e) {
-  return e instanceof Error ? e.message : String(e);
 }
 function isStr(x) {
   return typeof x === "string";
@@ -1742,13 +1726,13 @@ async function openStore(dir) {
     if (e.code === "ENOENT") {
       return new StoreImpl({ version: 1, tasks: [], runs: [], marks: {} }, path);
     }
-    throw new StoreError(`\u72B6\u6001\u6587\u4EF6\u8BFB\u4E0D\u51FA\u6765\uFF1A${errText3(e)}`);
+    throw new StoreError(`\u72B6\u6001\u6587\u4EF6\u8BFB\u4E0D\u51FA\u6765\uFF1A${errText(e)}`);
   }
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch (e) {
-    throw new StoreError(`\u72B6\u6001\u6587\u4EF6\u4E0D\u662F\u5408\u6CD5\u7684 JSON\uFF1A${errText3(e)}`);
+    throw new StoreError(`\u72B6\u6001\u6587\u4EF6\u4E0D\u662F\u5408\u6CD5\u7684 JSON\uFF1A${errText(e)}`);
   }
   const problem = validateState(parsed);
   if (problem)
@@ -1770,8 +1754,7 @@ async function migrateLegacyState(dir, env = process.env) {
     if (e.code !== "ENOENT")
       return;
   }
-  const xdg = env.XDG_CONFIG_HOME?.trim();
-  const legacy = join2(xdg || join2(homedir2(), ".config"), "magpie", LEGACY_DIR_NAME, STATE_FILE);
+  const legacy = join2(xdgConfigHome(env), "magpie", LEGACY_DIR_NAME, STATE_FILE);
   let raw;
   try {
     raw = await readFile2(legacy, "utf8");
@@ -1830,7 +1813,7 @@ async function acquireLock(dir, opts = {}) {
     } catch (e) {
       await unlink(tmp).catch(() => {});
       if (e.code !== "EEXIST") {
-        throw new Error(`\u65E0\u6CD5\u521B\u5EFA\u5355\u5B9E\u4F8B\u9501\uFF1A${errText3(e)}`);
+        throw new Error(`\u65E0\u6CD5\u521B\u5EFA\u5355\u5B9E\u4F8B\u9501\uFF1A${errText(e)}`);
       }
     }
     let raw;
@@ -1876,9 +1859,6 @@ function json(data, status = 200, headers = {}) {
     status,
     headers: { "content-type": "application/json; charset=utf-8", ...headers }
   });
-}
-function errText4(e) {
-  return e instanceof Error ? e.message : String(e);
 }
 var MIME = {
   ".js": "text/javascript; charset=utf-8",
@@ -1950,7 +1930,7 @@ async function startService(opts) {
         try {
           res = await handle(req);
         } catch (e) {
-          res = json({ error: errText4(e) }, 500, corsHeaders(req.headers.get("origin")));
+          res = json({ error: errText(e) }, 500, corsHeaders(req.headers.get("origin")));
         }
         res.headers.set(MARKER_HEADER, "1");
         return res;
@@ -1993,7 +1973,7 @@ async function startService(opts) {
     return scheduler.snapshot();
   }
   function opError(e, cors) {
-    const msg = errText4(e);
+    const msg = errText(e);
     if (msg === NOT_FOUND_MESSAGE)
       return json({ error: msg }, 404, cors);
     if (msg === CONFLICT_MESSAGE)
@@ -2004,7 +1984,7 @@ async function startService(opts) {
     try {
       return { value: await readBody(req) };
     } catch (e) {
-      return { error: json({ error: errText4(e) }, 400, cors) };
+      return { error: json({ error: errText(e) }, 400, cors) };
     }
   }
   function readonlyBlock(cors) {
@@ -2017,6 +1997,20 @@ async function startService(opts) {
     }
     return null;
   }
+  async function saveTask(req, cors, id) {
+    const input = await readBodyChecked(req, cors);
+    if ("error" in input)
+      return input.error;
+    const checked = validateTask(input.value, new Date);
+    if ("error" in checked)
+      return json({ error: checked.error, field: checked.field }, 400, cors);
+    const task = id === undefined ? checked.task : { ...checked.task, id };
+    try {
+      return json(await scheduler.upsert(task), 200, cors);
+    } catch (e) {
+      return opError(e, cors);
+    }
+  }
   async function api(req, url, origin) {
     const cors = corsHeaders(origin);
     const path = url.pathname;
@@ -2026,43 +2020,18 @@ async function startService(opts) {
       try {
         return json(await fetchCatalog(opts.base), 200, cors);
       } catch (e) {
-        return json({ error: errText4(e) }, 502, cors);
+        return json({ error: errText(e) }, 502, cors);
       }
     }
-    if (fatal !== null || lockedBy !== null) {
-      const blocked = readonlyBlock(cors);
-      if (blocked)
-        return blocked;
-    }
+    const blocked = readonlyBlock(cors);
+    if (blocked)
+      return blocked;
     const runMatch = /^\/api\/tasks\/([^/]+)\/run$/.exec(path);
     const idMatch = /^\/api\/tasks\/([^/]+)$/.exec(path);
-    if (path === "/api/tasks" && req.method === "POST") {
-      const input = await readBodyChecked(req, cors);
-      if ("error" in input)
-        return input.error;
-      const checked = validateTask(input.value, new Date);
-      if ("error" in checked)
-        return json({ error: checked.error, field: checked.field }, 400, cors);
-      try {
-        return json(await scheduler.upsert(checked.task), 200, cors);
-      } catch (e) {
-        return opError(e, cors);
-      }
-    }
-    if (idMatch && req.method === "PUT") {
-      const id = decodeURIComponent(idMatch[1]);
-      const input = await readBodyChecked(req, cors);
-      if ("error" in input)
-        return input.error;
-      const checked = validateTask(input.value, new Date);
-      if ("error" in checked)
-        return json({ error: checked.error, field: checked.field }, 400, cors);
-      try {
-        return json(await scheduler.upsert({ ...checked.task, id }), 200, cors);
-      } catch (e) {
-        return opError(e, cors);
-      }
-    }
+    if (path === "/api/tasks" && req.method === "POST")
+      return saveTask(req, cors, undefined);
+    if (idMatch && req.method === "PUT")
+      return saveTask(req, cors, decodeURIComponent(idMatch[1]));
     if (idMatch && req.method === "DELETE") {
       try {
         await scheduler.remove(decodeURIComponent(idMatch[1]));
@@ -2174,8 +2143,7 @@ function defaultDir(env = process.env) {
   const custom = env.WINDOW_WARMUP_DIR?.trim();
   if (custom)
     return custom;
-  const xdg = env.XDG_CONFIG_HOME?.trim();
-  return join4(xdg || join4(homedir3(), ".config"), "magpie", "window-warmup");
+  return join4(xdgConfigHome(env), "magpie", "window-warmup");
 }
 var instances = new Map;
 var plugin_default = {

@@ -1,6 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { lastDue, nextDaily, nextEvery, upcoming, validateTask, windowDue } from "../src/rules";
 import type { Trigger } from "../src/types";
+
+test("rules 只依赖 types：页面直接打包它，引入 node:* 或网关模块会让浏览器端构建失效", () => {
+  for (const file of ["rules.ts", "types.ts"]) {
+    const src = readFileSync(join(import.meta.dir, "..", "src", file), "utf8");
+    const imports = [...src.matchAll(/^import[^;]*?from\s+"([^"]+)"/gms)].map((m) => m[1]);
+    expect(imports.filter((s) => s !== "./types")).toEqual([]);
+  }
+});
 
 const SH = "Asia/Shanghai";
 const NY = "America/New_York";

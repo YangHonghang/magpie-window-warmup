@@ -3,20 +3,22 @@
 // 网关不可达时调度层要把失败写进执行记录，而不是被挂住的请求拖死。
 
 import { accountsOf, pickAutoModel } from "./accounts";
-import { magpieDirs, readKeyDirectory, readModelCache, type CachedModel } from "./magpie-files";
-import type {
-  Catalog,
-  CatalogProvider,
-  EffortPick,
-  QuotaEntry,
-  QuotaWindow,
-  RawModel,
-  SendResult,
-  Task,
+import { readDefaultKeyDirectory, readDefaultModelCache } from "./magpie-files";
+import { WARMUP_MESSAGE } from "./rules";
+import {
+  errText,
+  type Catalog,
+  type CatalogProvider,
+  type EffortPick,
+  type QuotaEntry,
+  type QuotaWindow,
+  type RawModel,
+  type SendResult,
+  type Task,
 } from "./types";
 
-// 自动选模型的规则在 accounts.ts（与账号规则同源）；这里转出保持既有公开 API 不变
-export { pickAutoModel };
+// 自动选模型的规则在 accounts.ts、探活消息在 rules.ts；这里转出保持既有公开 API 不变
+export { pickAutoModel, WARMUP_MESSAGE };
 
 /** MAGPIE_ADDR 缺省时的老端口 */
 const DEFAULT_GATEWAY = "http://127.0.0.1:3425";
@@ -137,10 +139,6 @@ function errorReason(text: string): string {
     /* 非 JSON 响应体 */
   }
   return text.trim().slice(0, REASON_MAX) || "上游未返回错误说明";
-}
-
-function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }
 
 async function requestJSON(
@@ -310,8 +308,8 @@ export function modelProvider(m: RawModel): string {
  * autoModel 用与调度器同一套规则在服务端算好，页面直接显示。
  */
 export async function fetchCatalog(base: string): Promise<Catalog> {
-  const [modelsData, quotas] = await Promise.all([
-    requestJSON(base, "/v1/models"),
+  const [models, quotas] = await Promise.all([
+    fetchModels(base),
     fetchQuotas(base).catch(() => ({ at: new Date(), entries: [] as QuotaEntry[] })),
   ]);
   const providers = new Map<string, CatalogProvider>();
@@ -324,10 +322,7 @@ export async function fetchCatalog(base: string): Promise<Catalog> {
     }
     return p;
   };
-  for (const item of dataArray(modelsData)) {
-    if (typeof item !== "object" || item === null) continue;
-    const m = item as RawModel;
-    if (typeof m.id !== "string" || !m.id || m.id.startsWith("group/")) continue;
+  for (const m of models) {
     const pid = modelProvider(m);
     // 归不到供应商的模型建不了任务（provider 必填），列出来只会是死选项
     if (!pid) continue;
@@ -337,18 +332,8 @@ export async function fetchCatalog(base: string): Promise<Catalog> {
     else rawModels.set(pid, [m]);
   }
   for (const q of quotas.entries) ensure(q.provider);
-  // providers.json 与各供应商的模型缓存逐个现读；读不出按「没有」处理，不让整个目录 502
-  const dirs = magpieDirs();
-  const keyDir = await readKeyDirectory(dirs.config).catch(() => null);
-  const caches = new Map<string, CachedModel[] | null>();
-  const cacheOf = async (pid: string): Promise<CachedModel[] | null> => {
-    let c = caches.get(pid);
-    if (c === undefined) {
-      c = await readModelCache(dirs.cache, pid);
-      caches.set(pid, c);
-    }
-    return c;
-  };
+  // providers.json 与各供应商的模型缓存现读（调度器发送前读的是同一份）；读不出按「没有」处理，不让整个目录 502
+  const keyDir = await readDefaultKeyDirectory();
   const list = [...providers.values()];
   for (const p of list) {
     const raws = rawModels.get(p.id) ?? [];
@@ -359,7 +344,7 @@ export async function fetchCatalog(base: string): Promise<Catalog> {
       models: raws.map((m) => m.id),
       quotas: quotas.entries,
       keyDir,
-      cache: await cacheOf(p.id),
+      cache: await readDefaultModelCache(p.id),
     });
     p.accounts = built.accounts;
     p.autoAccountModels = built.autoAccountModels;
@@ -381,8 +366,6 @@ function usableChatBody(text: string): boolean {
   }
 }
 
-/** 预热消息固定为 hi：探活用，不可配置（页面与校验都不再收自定义消息） */
-export const WARMUP_MESSAGE = "hi";
 
 /**
  * 发一次预热消息。pin 是调度器按统一账号规则算好的账号头值（null = 不带头，网关自动选）。

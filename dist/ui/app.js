@@ -1,4 +1,168 @@
-// web/app.ts
+// src/rules.ts
+var MINUTE_MS = 60000;
+var HOUR_MS = 3600000;
+var RESET_GRACE_MS = 30000;
+var LAST_DUE_LOOKBACK_MS = 48 * HOUR_MS;
+var NAME_MAX = 40;
+var formatters = new Map;
+function formatter(timeZone) {
+  let f = formatters.get(timeZone);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit"
+    });
+    formatters.set(timeZone, f);
+  }
+  return f;
+}
+function wallOf(t, timeZone) {
+  const p = {};
+  for (const part of formatter(timeZone).formatToParts(t)) {
+    if (part.type !== "literal")
+      p[part.type] = Number(part.value);
+  }
+  return { year: p.year, month: p.month, day: p.day, hour: p.hour, minute: p.minute };
+}
+function offsetMs(t, timeZone) {
+  const sec = Math.floor(t.getTime() / 1000) * 1000;
+  const w = wallOf(new Date(sec), timeZone);
+  return Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, sec / 1000 % 60) - sec;
+}
+function sameWall(w, y, mo, d, hh, mm) {
+  return w.year === y && w.month === mo && w.day === d && w.hour === hh && w.minute === mm;
+}
+function resolveWallTime(y, mo, d, hh, mm, timeZone) {
+  const guess = Date.UTC(y, mo - 1, d, hh, mm);
+  let t = guess - offsetMs(new Date(guess), timeZone);
+  t = guess - offsetMs(new Date(t), timeZone);
+  for (let i = 0;i < 4; i++) {
+    const w = wallOf(new Date(t), timeZone);
+    if (sameWall(w, y, mo, d, hh, mm)) {
+      return earliestInstanceOf(guess, t, y, mo, d, hh, mm, timeZone);
+    }
+    if (w.hour === hh && w.minute === mm) {
+      t += Date.UTC(y, mo - 1, d) - Date.UTC(w.year, w.month - 1, w.day);
+      continue;
+    }
+    const probe = guess - offsetMs(new Date(t), timeZone);
+    let lo = Math.min(t, probe);
+    const loOffset = offsetMs(new Date(lo), timeZone);
+    let hi = Math.max(t, probe);
+    if (offsetMs(new Date(hi), timeZone) === loOffset)
+      return new Date(t);
+    while (hi - lo > 1) {
+      const mid = lo + Math.floor((hi - lo) / 2);
+      if (offsetMs(new Date(mid), timeZone) === loOffset)
+        lo = mid;
+      else
+        hi = mid;
+    }
+    return new Date(hi);
+  }
+  return new Date(t);
+}
+function earliestInstanceOf(guess, t, y, mo, d, hh, mm, timeZone) {
+  const at = new Date(t);
+  const oAt = offsetMs(at, timeZone);
+  const back = t - 3 * HOUR_MS - MINUTE_MS;
+  if (offsetMs(new Date(back), timeZone) === oAt)
+    return at;
+  let lo = back;
+  let hi = t;
+  while (hi - lo > 1) {
+    const mid = lo + Math.floor((hi - lo) / 2);
+    if (offsetMs(new Date(mid), timeZone) === oAt)
+      hi = mid;
+    else
+      lo = mid;
+  }
+  const oBefore = offsetMs(new Date(lo), timeZone);
+  if (oBefore <= oAt)
+    return at;
+  const earlier = guess - oBefore;
+  return sameWall(wallOf(new Date(earlier), timeZone), y, mo, d, hh, mm) ? new Date(earlier) : at;
+}
+function occurrencesOnDay(y, mo, d, hh, mm, timeZone) {
+  const first = resolveWallTime(y, mo, d, hh, mm, timeZone);
+  const out = [first];
+  const guess = Date.UTC(y, mo - 1, d, hh, mm);
+  const oAt = offsetMs(first, timeZone);
+  const probeEnd = first.getTime() + 3 * HOUR_MS + MINUTE_MS;
+  if (offsetMs(new Date(probeEnd), timeZone) === oAt)
+    return out;
+  let lo = first.getTime();
+  let hi = probeEnd;
+  while (hi - lo > 1) {
+    const mid = lo + Math.floor((hi - lo) / 2);
+    if (offsetMs(new Date(mid), timeZone) === oAt)
+      lo = mid;
+    else
+      hi = mid;
+  }
+  const oAfter = offsetMs(new Date(hi), timeZone);
+  if (oAfter >= oAt)
+    return out;
+  const second = guess - oAfter;
+  if (second > first.getTime() && sameWall(wallOf(new Date(second), timeZone), y, mo, d, hh, mm)) {
+    out.push(new Date(second));
+  }
+  return out;
+}
+function nextCalDay(y, mo, d) {
+  const t = new Date(Date.UTC(y, mo - 1, d + 1));
+  return [t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate()];
+}
+function nextDaily(t, after) {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(t.time);
+  if (!m)
+    throw new Error("时间需为 24 小时制的 HH:MM");
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  const start = wallOf(after, t.timeZone);
+  let y = start.year;
+  let mo = start.month;
+  let d = start.day;
+  for (let i = 0;i < 400; i++) {
+    for (const occ of occurrencesOnDay(y, mo, d, hh, mm, t.timeZone)) {
+      if (occ.getTime() > after.getTime())
+        return occ;
+    }
+    [y, mo, d] = nextCalDay(y, mo, d);
+  }
+  throw new Error("无法计算下一次执行时间");
+}
+function nextEvery(t, after) {
+  const anchor = new Date(t.anchor).getTime();
+  if (Number.isNaN(anchor))
+    throw new Error("起点时间无法识别");
+  if (!Number.isFinite(t.hours) || t.hours <= 0)
+    throw new Error("间隔小时数必须为正数");
+  if (after.getTime() < anchor)
+    return new Date(anchor);
+  const step = t.hours * HOUR_MS;
+  const k = Math.floor((after.getTime() - anchor) / step) + 1;
+  return new Date(anchor + k * step);
+}
+function upcoming(trigger, now, n) {
+  if (trigger.kind === "window")
+    return [];
+  const out = [];
+  let cursor = new Date(now.getTime());
+  for (let i = 0;i < n; i++) {
+    cursor = trigger.kind === "daily" ? nextDaily(trigger, cursor) : nextEvery(trigger, cursor);
+    out.push(cursor);
+  }
+  return out;
+}
+
+// web/i18n.ts
 var I18N = {
   en: {
     "模型列表来自 Magpie 上次获取的结果。账号和模型对不上时，到 Magpie「供应商」里打开这个供应商，点「获取模型」，再回来刷新本页。": "The model list comes from Magpie's last fetch. If accounts and models don't match, open this provider under Magpie's Providers page, click Fetch models, then refresh this page.",
@@ -353,13 +517,20 @@ var lang = "zh";
 function setLang(raw) {
   lang = normalizeLang(raw);
 }
+function currentLang() {
+  return lang;
+}
 function t(s) {
   return I18N[lang]?.[s] ?? s;
 }
+
+// src/types.ts
+function errText(e) {
+  return e instanceof Error ? e.message : String(e);
+}
+
+// web/app.ts
 var DAY_MS = 86400000;
-var HOUR_MS = 3600000;
-var NAME_MAX = 40;
-var RESET_GRACE_MS = 30000;
 var POLL_MS = 3000;
 var CATALOG_POLL_MS = 60000;
 var RUNS_PREVIEW = 5;
@@ -613,72 +784,12 @@ function shouldCloseOnScroll(target, pop) {
     return false;
   return !pop.contains(target);
 }
-var fmtCache = new Map;
-function wallParts(t, timeZone) {
-  let f = fmtCache.get(timeZone);
-  if (!f) {
-    f = new Intl.DateTimeFormat("en-US", {
-      timeZone,
-      hourCycle: "h23",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit"
-    });
-    fmtCache.set(timeZone, f);
-  }
-  const p = {};
-  for (const part of f.formatToParts(t)) {
-    if (part.type !== "literal")
-      p[part.type] = Number(part.value);
-  }
-  return { y: p.year, mo: p.month, d: p.day, h: p.hour, mi: p.minute };
-}
-function tzOffsetMs(t, timeZone) {
-  const w = wallParts(t, timeZone);
-  return Date.UTC(w.y, w.mo - 1, w.d, w.h, w.mi) - Math.floor(t.getTime() / 60000) * 60000;
-}
-function nextDailyLocal(time, timeZone, after) {
-  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(time);
-  const hh = Number(m?.[1] ?? 6);
-  const mm = Number(m?.[2] ?? 0);
-  const w = wallParts(after, timeZone);
-  let y = w.y;
-  let mo = w.mo;
-  let d = w.d;
-  for (let i = 0;i < 3; i++) {
-    const guess = Date.UTC(y, mo - 1, d, hh, mm);
-    let t = guess - tzOffsetMs(new Date(guess), timeZone);
-    t = guess - tzOffsetMs(new Date(t), timeZone);
-    if (t > after.getTime())
-      return new Date(t);
-    const nd = new Date(Date.UTC(y, mo - 1, d + 1));
-    y = nd.getUTCFullYear();
-    mo = nd.getUTCMonth() + 1;
-    d = nd.getUTCDate();
-  }
-  return new Date(after.getTime() + DAY_MS);
-}
-function nextEveryLocal(hours, anchor, after) {
-  const a = new Date(anchor).getTime();
-  if (!Number.isFinite(a) || after.getTime() < a) {
-    return new Date(Number.isFinite(a) ? a : after.getTime());
-  }
-  const step = Math.max(hours, 1) * HOUR_MS;
-  const k = Math.floor((after.getTime() - a) / step) + 1;
-  return new Date(a + k * step);
-}
 function nextPointsAfter(trigger, after, count) {
-  const out = [];
-  if (trigger.kind === "window")
-    return out;
-  let cursor = after;
-  for (let i = 0;i < count; i++) {
-    cursor = trigger.kind === "daily" ? nextDailyLocal(trigger.time, trigger.timeZone, cursor) : nextEveryLocal(trigger.hours, trigger.anchor, cursor);
-    out.push(cursor);
+  try {
+    return upcoming(trigger, after, count);
+  } catch {
+    return [];
   }
-  return out;
 }
 var p2 = (n) => String(n).padStart(2, "0");
 var hm = (d) => `${p2(d.getHours())}:${p2(d.getMinutes())}`;
@@ -711,9 +822,6 @@ function localInputToISO(v) {
     return null;
   const d = new Date(v);
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
-}
-function errText(e) {
-  return e instanceof Error ? e.message : String(e);
 }
 function cloneTask(t) {
   return JSON.parse(JSON.stringify(t));
@@ -907,7 +1015,7 @@ function row(ed, label, ...kids) {
 var tzOptionsCache = null;
 function tzOffsetLabel(tz, at) {
   try {
-    const min = tzOffsetMs(at, tz) / 60000;
+    const min = offsetMs(at, tz) / 60000;
     const abs = Math.abs(min);
     return `UTC${min < 0 ? "-" : "+"}${Math.floor(abs / 60)}${abs % 60 ? `:${p2(abs % 60)}` : ""}`;
   } catch {
@@ -1113,42 +1221,34 @@ async function toggleEnabled(saved) {
     render();
   }
 }
-function buildEditor() {
-  const d = draft;
-  if (!d)
-    return el("div");
-  const providers = catalog?.providers ?? [];
-  const provider = providers.find((p) => p.id === d.provider);
-  const ed = el("div", "editor");
-  let droppedWindow = false;
-  if (d.trigger.kind === "window" && !accountHasWindows(d.provider, d.account, providers)) {
-    d.trigger = { kind: "daily", time: "06:00", timeZone: localTZ() };
-    droppedWindow = true;
-  }
-  const saved = currentSavedTask();
+function firstWindow(providerId, accountId, providers) {
+  return windowOptions(providerId, accountId, "", providers).find((o) => o.value)?.value ?? "";
+}
+function adoptAccount(provider, accountId) {
+  if (!draft)
+    return;
+  draft.account = accountId;
+  if (draft.model && !accountModelView(provider, accountId).models?.includes(draft.model))
+    draft.model = "";
+}
+function editorNotes(d, saved) {
+  const notes = [];
   if (saved && d.enabled) {
     const last = latestRunOf(saved.id);
     if (last && last.outcome === "failed") {
       const n = el("div", "note full");
       n.append(`${t("上次失败")}（${runTimeLabel(last.startedAt, new Date)}）：`);
       n.append(el("span", undefined, `${last.reason}。${t("任务没有暂停，下一次照常发送。")}`));
-      ed.append(n);
+      notes.push(n);
     }
   }
   if (staleNote)
-    ed.append(el("div", "stale full", t(staleNote)));
+    notes.push(el("div", "stale full", t(staleNote)));
   if (formError)
-    ed.append(el("div", "note full", formError));
-  const name = el("input", "text");
-  name.dataset.fk = "name";
-  name.value = d.name;
-  name.maxLength = NAME_MAX;
-  name.placeholder = t("给任务起个名字");
-  name.addEventListener("input", () => onNameInput(() => {
-    if (draft)
-      draft.name = name.value;
-  }));
-  row(ed, t("名称"), name);
+    notes.push(el("div", "note full", formError));
+  return notes;
+}
+function sendToParts(d, providers, provider) {
   const fs = el("div", "fields c3");
   const provOpts = providers.map((p) => ({ value: p.id, text: p.id }));
   if (d.provider && !provOpts.some((o) => o.value === d.provider))
@@ -1162,26 +1262,17 @@ function buildEditor() {
     draft.provider = v;
     draft.account = forceWindowAccount(v, providers);
     if (draft.trigger.kind === "window") {
-      draft.trigger = { kind: "window", window: windowOptions(v, draft.account, "", providers).find((o) => o.value)?.value ?? "" };
+      draft.trigger = { kind: "window", window: firstWindow(v, draft.account, providers) };
     }
     draft.model = "";
     formError = null;
     render();
   }));
-  if (d.trigger.kind === "window" && !d.account)
-    d.account = forceWindowAccount(d.provider, providers);
-  const adoptAccount = (v) => {
-    if (!draft)
-      return;
-    draft.account = v;
-    if (draft.model && !accountModelView(provider, v).models?.includes(draft.model))
-      draft.model = "";
-  };
   fs.append(sel(t("账号"), accountOptions(d.provider, d.account, providers), d.account, (v) => {
     markDirty();
-    adoptAccount(v);
+    adoptAccount(provider, v);
     if (draft && draft.trigger.kind === "window") {
-      draft.trigger = { kind: "window", window: windowOptions(draft.provider, v, "", providers).find((o) => o.value)?.value ?? "" };
+      draft.trigger = { kind: "window", window: firstWindow(draft.provider, v, providers) };
     }
     formError = null;
     render();
@@ -1208,7 +1299,9 @@ function buildEditor() {
   if (d.trigger.kind === "window") {
     parts.push(el("div", "hint mute", t("跟随窗口重置时必须指定账号，每个账号的窗口各自计时。")));
   }
-  row(ed, t("发送到"), ...parts);
+  return parts;
+}
+function triggerSeg(d, providers, provider) {
   const hasWindows = accountHasWindows(d.provider, d.account, providers);
   const seg = el("div", "seg");
   for (const [k, txt] of TRIGGERS) {
@@ -1221,8 +1314,8 @@ function buildEditor() {
         return;
       markDirty();
       if (k === "window") {
-        adoptAccount(draft.account || forceWindowAccount(draft.provider, providers));
-        draft.trigger = { kind: "window", window: windowOptions(draft.provider, draft.account, "", providers).find((o) => o.value)?.value ?? "" };
+        adoptAccount(provider, draft.account || forceWindowAccount(draft.provider, providers));
+        draft.trigger = { kind: "window", window: firstWindow(draft.provider, draft.account, providers) };
       } else if (k === "daily") {
         draft.trigger = { kind: "daily", time: "06:00", timeZone: localTZ() };
       } else {
@@ -1233,6 +1326,9 @@ function buildEditor() {
     });
     seg.append(b);
   }
+  return seg;
+}
+function triggerFields(d, providers) {
   const line = el("div", "fields " + (d.trigger.kind === "window" ? "c1" : "c2"));
   line.style.marginTop = "8px";
   if (d.trigger.kind === "window") {
@@ -1289,15 +1385,15 @@ function buildEditor() {
     });
     line.append(field(t("从"), an));
   }
+  return line;
+}
+function nextPreview(d, provider, saved) {
   const nextEl = el("div", "next");
   const now = new Date;
-  const useServer = !!(saved && !dirty && state);
+  const nextIso = saved && !dirty && state ? state.next[saved.id] ?? null : null;
   if (d.trigger.kind === "window") {
     const winName = d.trigger.window;
-    let first = "";
-    const nextIso = useServer && saved ? state?.next[saved.id] ?? null : null;
-    if (nextIso)
-      first = nextLabel(nextIso, now);
+    let first = nextIso ? nextLabel(nextIso, now) : "";
     if (!first) {
       const win = provider?.accounts.find((a) => a.id === d.account)?.windows.find((w) => w.name === winName);
       if (win?.resetsAt) {
@@ -1305,26 +1401,20 @@ function buildEditor() {
       }
     }
     nextEl.append(`${t("接下来")} `, el("b", undefined, first ? `${first}${t("，之后跟随每次重置")}` : t("等下一次额度刷新，之后跟随每次重置")));
+    return nextEl;
+  }
+  const dates = [];
+  const trig = saved?.trigger ?? null;
+  if (trig && trig.kind !== "window" && nextIso) {
+    const first = new Date(nextIso);
+    dates.push(first, ...nextPointsAfter(trig, first, 2));
   } else {
-    const dates = [];
-    const trig = saved?.trigger ?? null;
-    const nextIso = useServer && saved ? state?.next[saved.id] ?? null : null;
-    if (useServer && trig && trig.kind !== "window" && nextIso) {
-      let cursor = new Date(nextIso);
-      dates.push(cursor);
-      for (let i = 0;i < 2; i++) {
-        cursor = trig.kind === "daily" ? nextDailyLocal(trig.time, trig.timeZone, cursor) : nextEveryLocal(trig.hours, trig.anchor, cursor);
-        dates.push(cursor);
-      }
-    } else {
-      dates.push(...nextPointsAfter(d.trigger, now, 3));
-    }
-    nextEl.append(`${t("接下来")} `, el("b", undefined, dates.length ? dates.map((x) => nextLabel(x.toISOString(), now)).join(" · ") : "—"));
+    dates.push(...nextPointsAfter(d.trigger, now, 3));
   }
-  if (droppedWindow) {
-    nextEl.prepend(el("div", "hint mute", t("这个账号没有可跟随的窗口，已改为每天定时，保存后生效。")));
-  }
-  row(ed, t("触发"), seg, line, nextEl);
+  nextEl.append(`${t("接下来")} `, el("b", undefined, dates.length ? dates.map((x) => nextLabel(x.toISOString(), now)).join(" · ") : "—"));
+  return nextEl;
+}
+function editorActions(saved) {
   const act = el("div", "actions full");
   const del = el("button", "btn danger", saved ? deleteArmed(confirmDeleteAt, Date.now()) ? t("确认删除") : t("删除") : t("放弃"));
   del.type = "button";
@@ -1342,7 +1432,10 @@ function buildEditor() {
     saveBtn.addEventListener("click", () => void save());
     act.append(cancel, saveBtn);
   }
-  ed.append(act);
+  return act;
+}
+function runsSection(saved) {
+  const now = new Date;
   const box = el("div", "full");
   const rh = el("div", "runs-h");
   rh.append(el("b", undefined, t("执行记录")), el("span", undefined, t("最近 50 次")), el("span", "sp"));
@@ -1377,7 +1470,41 @@ function buildEditor() {
     runsBox.append(more);
   }
   box.append(runsBox);
-  ed.append(box);
+  return box;
+}
+function buildEditor() {
+  const d = draft;
+  if (!d)
+    return el("div");
+  const providers = catalog?.providers ?? [];
+  const provider = providers.find((p) => p.id === d.provider);
+  const ed = el("div", "editor");
+  let droppedWindow = false;
+  if (d.trigger.kind === "window" && !accountHasWindows(d.provider, d.account, providers)) {
+    d.trigger = { kind: "daily", time: "06:00", timeZone: localTZ() };
+    droppedWindow = true;
+  }
+  const saved = currentSavedTask();
+  ed.append(...editorNotes(d, saved));
+  const name = el("input", "text");
+  name.dataset.fk = "name";
+  name.value = d.name;
+  name.maxLength = NAME_MAX;
+  name.placeholder = t("给任务起个名字");
+  name.addEventListener("input", () => onNameInput(() => {
+    if (draft)
+      draft.name = name.value;
+  }));
+  row(ed, t("名称"), name);
+  if (d.trigger.kind === "window" && !d.account)
+    d.account = forceWindowAccount(d.provider, providers);
+  row(ed, t("发送到"), ...sendToParts(d, providers, provider));
+  const nextEl = nextPreview(d, provider, saved);
+  if (droppedWindow) {
+    nextEl.prepend(el("div", "hint mute", t("这个账号没有可跟随的窗口，已改为每天定时，保存后生效。")));
+  }
+  row(ed, t("触发"), triggerSeg(d, providers, provider), triggerFields(d, providers), nextEl);
+  ed.append(editorActions(saved), runsSection(saved));
   f = { name };
   return ed;
 }
@@ -1469,7 +1596,7 @@ function renderList() {
     isReadonly(),
     runsExpanded,
     confirming,
-    lang,
+    currentLang(),
     catalogSig(),
     runsViewSig(),
     state === null
@@ -1662,7 +1789,7 @@ function applyTheme() {
 }
 function applyStaticTexts() {
   document.title = t("窗口预热");
-  document.documentElement.lang = lang;
+  document.documentElement.lang = currentLang();
   const newBtn = document.getElementById("new");
   if (newBtn)
     newBtn.textContent = t("新建任务");

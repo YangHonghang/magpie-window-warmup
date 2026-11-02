@@ -39,9 +39,8 @@ export function magpieDirs(
   moduleDir: string = import.meta.dir,
   p: typeof path = path,
 ): { config: string; cache: string } {
-  const home = homedir();
-  const installConfig = p.resolve(rooted(env.XDG_CONFIG_HOME, p) ?? p.join(home, ".config"), "magpie");
-  const installCache = p.resolve(rooted(env.XDG_CACHE_HOME, p) ?? p.join(home, ".cache"), "magpie");
+  const installConfig = p.resolve(xdgConfigHome(env, p), "magpie");
+  const installCache = p.resolve(rooted(env.XDG_CACHE_HOME, p) ?? p.join(homedir(), ".cache"), "magpie");
   const segments = moduleDir.split(p.sep === "\\" ? /[\\/]/ : p.sep).filter((s) => s !== "");
   const tail = segments.slice(-PLUGIN_DIR_TAIL.length);
   const installed =
@@ -59,6 +58,30 @@ export function magpieDirs(
 function rooted(v: string | undefined, p: typeof path): string | null {
   const t = v?.trim();
   return t && p.isAbsolute(t) ? t : null;
+}
+
+/**
+ * XDG 配置根目录（不含 magpie 段）：插件数据目录、旧包迁移来源与 Magpie 配置目录
+ * 都从这里推，三者必须用同一语义，否则相对路径的 XDG_CONFIG_HOME 会让它们各指一处。
+ */
+export function xdgConfigHome(
+  env: Record<string, string | undefined> = process.env,
+  p: typeof path = path,
+): string {
+  return rooted(env.XDG_CONFIG_HOME, p) ?? p.join(homedir(), ".config");
+}
+
+// 目录（/api/catalog）与调度器都经下面两个入口按默认位置读 Magpie 文件。
+// 位置每次现推（纯字符串运算）：环境变量在进程内可能被改（测试即如此），不做缓存。
+
+/** 按默认位置读 providers.json；读不出（损坏/权限）按 null 处理，调用方当「没有 key 目录」 */
+export function readDefaultKeyDirectory(): Promise<Map<string, KeyDirectoryEntry> | null> {
+  return readKeyDirectory(magpieDirs().config).catch(() => null);
+}
+
+/** 按默认位置读某供应商的模型缓存；没有缓存为 null */
+export function readDefaultModelCache(providerId: string): Promise<CachedModel[] | null> {
+  return readModelCache(magpieDirs().cache, providerId);
 }
 
 /**

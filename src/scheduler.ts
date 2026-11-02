@@ -7,15 +7,22 @@ import { randomUUID } from "node:crypto";
 import { modelsForAccount, pinFor, pickAutoModel, windowsForAccount } from "./accounts";
 import { fetchModels, fetchQuotas, modelProvider, pickEffort, refreshQuotaCard, send } from "./gateway";
 import {
-  magpieDirs,
-  readKeyDirectory,
-  readModelCache,
+  readDefaultKeyDirectory,
+  readDefaultModelCache,
   type CachedModel,
   type KeyDirectoryEntry,
 } from "./magpie-files";
 import { hourFloorISO, lastDue, nextDaily, nextEvery, upcoming, windowDue } from "./rules";
 import type { Store, TaskMarks } from "./store";
-import type { QuotaEntry, RawModel, Run, SendResult, Task } from "./types";
+import {
+  errText,
+  type QuotaEntry,
+  type QuotaWindow,
+  type RawModel,
+  type Run,
+  type SendResult,
+  type Task,
+} from "./types";
 
 /** 单个定时器的最长睡眠：醒来重算，弥补系统睡眠/时钟跳变 */
 const TIMER_CAP_MS = 600_000;
@@ -31,8 +38,8 @@ const CARD_FRESH_MS = 60_000;
 /** 同一张卡两次重读请求的最小间隔（magpie 侧另有 30 秒限频） */
 const CARD_REFRESH_GAP_MS = 60_000;
 const HOUR_MS = 3_600_000;
-const DAY_MS = 24 * HOUR_MS;
 /** snapshot 时间轴只画未来 24 小时 */
+const DAY_MS = 24 * HOUR_MS;
 
 const INTERRUPTED_REASON = "Magpie 在发送中途退出，结果未知";
 const OVERLAP_REASON = "上一次发送还没结束，本次跳过";
@@ -68,7 +75,7 @@ export interface SchedulerDeps {
   quotasFn?: QuotasFn;
   refreshCardFn?: RefreshCardFn;
   modelsFn?: ModelsFn;
-  /** key 目录与模型缓存的读取器；缺省按 magpieDirs() 推导的默认位置读 */
+  /** key 目录与模型缓存的读取器；缺省与 /api/catalog 一样按默认位置读（readDefault*） */
   keyDirFn?: KeyDirFn;
   modelCacheFn?: ModelCacheFn;
 }
@@ -91,7 +98,8 @@ export interface StateView {
 }
 
 type QuotaSnapshot = { at: Date; entries: QuotaEntry[] };
-type WindowInfo = { at: Date; resetKey: string } | { at: Date; error: string };
+/** 窗口任务按当前快照算出的到期点与去重键 */
+type WindowDue = { at: Date; resetKey: string };
 
 interface Inflight {
   abort: AbortController;
@@ -100,8 +108,41 @@ interface Inflight {
   done: Promise<void>;
 }
 
-function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
+/** 白名单挑任务内容字段：档位等运行时字段永远进不了任务文件 */
+function taskContent(input: TaskInput): Omit<Task, "id" | "createdAt" | "updatedAt"> {
+  return {
+    name: input.name,
+    enabled: input.enabled,
+    provider: input.provider,
+    account: input.account,
+    model: input.model,
+    message: input.message,
+    trigger: input.trigger,
+  };
+}
+
+/** 一条刚开始的执行记录（running）；直接失败的记录在此基础上覆盖结果字段 */
+function newRun(
+  task: Task,
+  at: Date,
+  due: Date | null,
+  source: Run["source"],
+  resetKey: string | null,
+): Run {
+  return {
+    id: randomUUID(),
+    taskId: task.id,
+    source,
+    due: due?.toISOString() ?? null,
+    startedAt: at.toISOString(),
+    endedAt: null,
+    outcome: "running",
+    reason: "",
+    effort: null,
+    model: null,
+    ms: null,
+    resetKey,
+  };
 }
 
 export class Scheduler {
@@ -153,10 +194,9 @@ export class Scheduler {
     this.quotasFn = deps.quotasFn ?? fetchQuotas;
     this.refreshCardFn = deps.refreshCardFn ?? refreshQuotaCard;
     this.modelsFn = deps.modelsFn ?? fetchModels;
-    // 目录位置进程内不变，构造时推导一次；providers.json 损坏按「读不出」处理（null）
-    const dirs = magpieDirs();
-    this.keyDirFn = deps.keyDirFn ?? (() => readKeyDirectory(dirs.config).catch(() => null));
-    this.modelCacheFn = deps.modelCacheFn ?? ((pid) => readModelCache(dirs.cache, pid));
+    // 缺省与 /api/catalog 读同一份 Magpie 文件；providers.json 损坏按「读不出」处理（null）
+    this.keyDirFn = deps.keyDirFn ?? readDefaultKeyDirectory;
+    this.modelCacheFn = deps.modelCacheFn ?? readDefaultModelCache;
   }
 
   /** 启动：把遗留的 running 记录改判 unknown，再排定时器。可重复调用 */
@@ -194,16 +234,9 @@ export class Scheduler {
         const idx = this.store.data.tasks.findIndex((t) => t.id === input.id);
         if (idx < 0) throw new Error(NOT_FOUND_MESSAGE);
         const prev = this.store.data.tasks[idx];
-        // 白名单挑字段，档位等运行时字段永远进不了任务文件
         const next: Task = {
           id: prev.id,
-          name: input.name,
-          enabled: input.enabled,
-          provider: input.provider,
-          account: input.account,
-          model: input.model,
-          message: input.message,
-          trigger: input.trigger,
+          ...taskContent(input),
           createdAt: prev.createdAt,
           updatedAt: now.toISOString(),
         };
@@ -220,13 +253,7 @@ export class Scheduler {
       }
       const task: Task = {
         id: randomUUID(),
-        name: input.name,
-        enabled: input.enabled,
-        provider: input.provider,
-        account: input.account,
-        model: input.model,
-        message: input.message,
-        trigger: input.trigger,
+        ...taskContent(input),
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
       };
@@ -308,34 +335,20 @@ export class Scheduler {
     points: TimelinePoint[],
   ): void {
     if (task.trigger.kind === "window") {
-      const info = this.windowInfo(task, now);
+      const due = this.currentWindowDue(task, now);
       let at: Date | null = null;
-      if (info && !("error" in info)) {
-        const tried = this.marksOf(task.id).resetKeys.includes(info.resetKey);
-        if (info.at.getTime() > now.getTime()) {
-          at = tried ? null : info.at;
-        } else if (!tried) {
-          // 空闲窗口且本轮没发过：快照新鲜就立即发（调度器会在到点前先刷新快照），
-          // 快照过期/缺失才按刷新节奏等下一轮——保存即符合条件不该再等 10 分钟
-          at = this.snapshotFresh(now) ? now : new Date(now.getTime() + QUOTA_REFRESH_MS);
-        }
+      if (due && !this.tried(task, due)) {
+        // 空闲窗口且本轮没发过：快照新鲜就立即发（调度器会在到点前先刷新快照），
+        // 快照过期/缺失才按刷新节奏等下一轮——保存即符合条件不该再等 10 分钟
+        if (due.at.getTime() > now.getTime()) at = due.at;
+        else at = this.snapshotFresh(now) ? now : new Date(now.getTime() + QUOTA_REFRESH_MS);
       }
       next[task.id] = at ? at.toISOString() : null;
       if (at && at.getTime() > now.getTime() && at.getTime() <= now.getTime() + DAY_MS) {
         points.push({ taskId: task.id, at: at.toISOString() });
       }
     } else {
-      const marks = this.store.data.marks[task.id];
-      const lastMark = marks?.lastDue ? new Date(marks.lastDue) : null;
-      const recent = lastDue(task.trigger, now);
-      // && 直写会把布尔 false 混进类型，这里显式收敛成 Date | null
-      const pendingCatchup =
-        recent !== null &&
-        (!lastMark || recent.getTime() > lastMark.getTime()) &&
-        recent.getTime() > new Date(task.updatedAt).getTime()
-          ? recent
-          : null;
-      const base = pendingCatchup ?? now;
+      const base = this.pendingFixedDue(task, now) ?? now;
       const at =
         task.trigger.kind === "daily" ? nextDaily(task.trigger, base) : nextEvery(task.trigger, base);
       next[task.id] = at.toISOString();
@@ -442,91 +455,113 @@ export class Scheduler {
     this.rearm();
   }
 
+  /**
+   * daily/every 任务已消费到哪一刻：上次执行的到期点与最后一次编辑取较晚者。
+   * 只有严格晚于它的应到点才有效——编辑之前错过的点不补，已执行的点不重发。
+   */
+  private fixedConsumedUntil(task: Task): number {
+    const last = this.store.data.marks[task.id]?.lastDue;
+    const updated = new Date(task.updatedAt).getTime();
+    return last ? Math.max(new Date(last).getTime(), updated) : updated;
+  }
+
+  /** daily/every 任务待补发的最近应到点（还没消费过）；没有为 null */
+  private pendingFixedDue(task: Task, now: Date): Date | null {
+    const recent = lastDue(task.trigger, now);
+    return recent && recent.getTime() > this.fixedConsumedUntil(task) ? recent : null;
+  }
+
   /** 评估 daily/every 任务：最近应到点若晚于上次执行且晚于 updatedAt，就发一次 */
   private async evaluateFixed(task: Task, now: Date): Promise<void> {
-    const marks = this.marksOf(task.id);
-    const lastMark = marks.lastDue ? new Date(marks.lastDue) : null;
-    const recent = lastDue(task.trigger, now);
-    if (!recent) return;
-    const pending =
-      (!lastMark || recent.getTime() > lastMark.getTime()) &&
-      recent.getTime() > new Date(task.updatedAt).getTime();
-    if (!pending) return;
+    const due = this.pendingFixedDue(task, now);
+    if (!due) return;
     const armed = this.armedFor.get(task.id) ?? null;
     const source: Run["source"] =
-      armed !== null && armed.getTime() === recent.getTime() ? "schedule" : "catchup";
-    await this.fire(task, recent, source, null);
+      armed !== null && armed.getTime() === due.getTime() ? "schedule" : "catchup";
+    await this.fire(task, due, source, null);
   }
 
   private async evaluateWindow(task: Task, now: Date): Promise<void> {
-    const marks = this.marksOf(task.id);
-    const info = this.windowInfo(task, now);
     // 拿不到窗口不记失败：额度卡时有时无（插件供应商的用量读取会瞬断、刚刷新时缓存
     // 短暂缺卡），按失败上报只会刷一屏红字。等下一轮刷新，页面上的账号/窗口下拉会
     // 显示当前实际有哪些；账号或窗口被永久删掉时，编辑区能看出来
-    if (!info || "error" in info) return;
-    if (info.at.getTime() > now.getTime()) return; // 还没到 resetsAt+30s
-    if (marks.resetKeys.includes(info.resetKey)) return; // 同一 resetKey 最多尝试一次
-    marks.resetKeys.push(info.resetKey);
+    const due = this.currentWindowDue(task, now);
+    if (!due || !this.windowReady(task, due, now)) return;
+    const marks = this.marksOf(task.id);
+    marks.resetKeys.push(due.resetKey);
     // 同一实际重置只花一次额度：把本次到期所在小时的 idle key 一并消费，
     // 免得缓存随后丢掉 resetsAt 时，同一小时里又被当成新的空闲事件发一次
-    const companion = `idle:${hourFloorISO(info.at)}`;
-    if (companion !== info.resetKey) marks.resetKeys.push(companion);
+    const companion = `idle:${hourFloorISO(due.at)}`;
+    if (companion !== due.resetKey) marks.resetKeys.push(companion);
     this.quotaStale = true; // 发送改变额度状态，下一轮先刷新快照再判断
-    await this.fire(task, info.at, "schedule", info.resetKey);
+    await this.fire(task, due.at, "schedule", due.resetKey);
   }
 
-  /** 用当前快照判断窗口任务的到期点；null 表示拿不到（无快照） */
-  private windowInfo(task: Task, now: Date): WindowInfo | null {
-    if (task.trigger.kind !== "window") return null;
-    const snap = this.quota;
-    if (!snap) return null;
-    if (!task.account) return { at: snap.at, error: "窗口任务没有指定账号" };
+  /** 这个 resetKey 已经尝试过（同一 resetKey 最多尝试一次，成功失败未知都算） */
+  private tried(task: Task, due: WindowDue): boolean {
+    return this.marksOf(task.id).resetKeys.includes(due.resetKey);
+  }
+
+  /** 已过 resetsAt+30s（或空闲立即到期）且本轮还没尝试过：该发了 */
+  private windowReady(task: Task, due: WindowDue, now: Date): boolean {
+    return due.at.getTime() <= now.getTime() && !this.tried(task, due);
+  }
+
+  /** 任务所选窗口在当前快照里的样子；无快照、没账号、额度里找不到账号/窗口都是 undefined */
+  private quotaWindow(task: Task): QuotaWindow | undefined {
+    if (task.trigger.kind !== "window" || !this.quota || !task.account) return undefined;
+    const name = task.trigger.window;
     // 账号 → 窗口走统一账号列表：key 账号用指纹反查 key 名再匹配 ~keys 卡（accounts.ts 共用实现）
-    const windows = windowsForAccount(task.provider, task.account, snap.entries, this.keyDirMap);
-    if (windows === null) return { at: snap.at, error: `额度里没有账号 ${task.account}` };
-    // 回调里拿不到外层的 kind 收窄（trigger 可变），先提成常量
-    const windowName = task.trigger.kind === "window" ? task.trigger.window : "";
-    const win = windows.find((w) => w.name === windowName);
-    const due = windowDue(win, snap.at);
-    if ("error" in due) return { at: snap.at, error: due.error };
-    const raw = win?.resetsAt;
-    const rawValid = !!raw && !Number.isNaN(new Date(raw).getTime());
-    if (raw && rawValid) {
-      // 记下最近见到的重置时间（变了才落盘）：额度卡瞬断丢了 resetsAt 时靠它分辨真假空闲
+    const windows = windowsForAccount(task.provider, task.account, this.quota.entries, this.keyDirMap);
+    return windows?.find((w) => w.name === name);
+  }
+
+  /**
+   * 记下各窗口任务最近见到的重置时间（变了才落盘）：额度卡瞬断丢了 resetsAt 时，
+   * currentWindowDue 靠它分辨真假空闲。额度快照或 key 目录一更新就要补记，新建/编辑任务后也要。
+   */
+  private recordResets(): void {
+    let dirty = false;
+    for (const task of this.store.data.tasks) {
+      if (!task.enabled) continue;
+      const raw = this.quotaWindow(task)?.resetsAt;
+      if (!raw || Number.isNaN(new Date(raw).getTime())) continue;
       const mark = this.marksOf(task.id);
       if (mark.lastReset !== raw) {
         mark.lastReset = raw;
-        void this.trackSave();
+        dirty = true;
       }
     }
+    if (dirty) void this.trackSave();
+  }
+
+  /**
+   * 用当前快照判断窗口任务的到期点与去重键；null 表示这一轮当没数据，等下一轮刷新
+   * （无快照、找不到账号或窗口、读数不可信）。纯计算，不改任何状态。
+   */
+  private currentWindowDue(task: Task, now: Date): WindowDue | null {
+    const win = this.quotaWindow(task);
+    if (!win || !this.quota) return null;
+    const due = windowDue(win, this.quota.at);
+    if ("error" in due) return null;
     // 空闲读数早于上次发送：那是发送前读的（magpie 只在路由请求那一刻读卡），当没数据，
     // 等 readCards 拿到发送后的读数再判断——否则跨整点 idle key 一变就会再发一次
     if (due.resetKey.startsWith("idle:") && this.staleIdle(task)) return null;
-    if (raw && rawValid) {
+    const raw = win.resetsAt;
+    if (raw && !Number.isNaN(new Date(raw).getTime())) {
       // 只要窗口带着可解析的 resetsAt，key 就用 resetsAt 本身：与重置发送同 key，消费过
       // 就绝不再发（刷新/跨小时/重启都一样），出现新 resetsAt 才是新事件；
       // truthy 但解析不了的 resetsAt 当缺失处理，保留按小时限频。
-      if (due.resetKey.startsWith("idle:")) {
-        return { at: due.at, resetKey: raw };
-      }
-      return due;
+      return { at: due.at, resetKey: raw };
     }
     // resetsAt 缺失或解析不了——两种可能：真空闲（没开始/上一轮已过），或卡瞬断。
     // 之前见过且还没到的重置时间说明窗口其实在计时，这轮当没数据，静默等下一轮刷新；
     // 已消费过的未来 resetsAt 同理（重启后 lastReset 还没补上时兜一道）。
+    // idle: 等非时间形态的 key 解析出 NaN，比较恒为假，不用单独排除
     const mark = this.marksOf(task.id);
-    const last = mark.lastReset;
-    const seenFuture =
-      (last ? new Date(last).getTime() : NaN) > now.getTime() ||
-      mark.resetKeys.some(
-        (k) =>
-          !k.startsWith("idle:") &&
-          !k.startsWith("missing:") &&
-          !Number.isNaN(new Date(k).getTime()) &&
-          new Date(k).getTime() > now.getTime(),
-      );
-    if (seenFuture) return null;
+    const isFuture = (iso: string | null | undefined): boolean =>
+      !!iso && new Date(iso).getTime() > now.getTime();
+    if (isFuture(mark.lastReset) || mark.resetKeys.some(isFuture)) return null;
     return due;
   }
 
@@ -568,13 +603,10 @@ export class Scheduler {
       const readAt = new Date(card.readAt ?? "").getTime();
       const settled = this.lastSentMs(task) + POST_SEND_SETTLE_MS;
       const afterSend = now.getTime() >= settled && readAt < settled;
-      const info = this.windowInfo(task, now);
-      const dueNow =
-        info !== null &&
-        !("error" in info) &&
-        info.at.getTime() <= now.getTime() &&
-        !this.marksOf(task.id).resetKeys.includes(info.resetKey) &&
-        !(now.getTime() - readAt <= CARD_FRESH_MS);
+      const due = this.currentWindowDue(task, now);
+      // readAt 缺失时是 NaN，「足够新」比较为假，照样算需要重读
+      const readFresh = now.getTime() - readAt <= CARD_FRESH_MS;
+      const dueNow = due !== null && this.windowReady(task, due, now) && !readFresh;
       if (!afterSend && !dueNow) continue;
       const key = `${card.provider}|${card.account}`;
       const last = this.lastCardRefresh.get(key);
@@ -601,7 +633,7 @@ export class Scheduler {
     // 快照还新鲜但 key 目录没读到（上轮失败）：也要再补读，指纹账号的窗口映射等着它
     if (quotaFresh && this.keyDirMap !== null) return;
     this.quotaTried = true;
-    // key 目录与额度快照一起等完再返回：windowInfo 是同步路径，只等额度的话，
+    // key 目录与额度快照一起等完再返回：currentWindowDue 是同步路径，只等额度的话，
     // key 目录（真实文件 I/O）后到会让指纹账号在首轮误报「额度里没有账号」。
     // key 目录读失败保留旧值（可能仍是 null），不拿失败结果盖掉上一次的好数据
     const [keyDir, snap] = await Promise.all([
@@ -621,6 +653,7 @@ export class Scheduler {
       // 刷新失败保留旧快照，下个周期再试；额度读不到不值得记一条失败记录
       this.quotaStale = true;
     }
+    this.recordResets();
   }
 
   /** 发送一次：先落盘 running 与 lastDue，再解析档位、调用 sendFn；收尾游离，返回 running 记录 */
@@ -637,20 +670,7 @@ export class Scheduler {
       return this.appendFailure(task, now, due, OVERLAP_REASON, resetKey, source);
     }
     if (due && task.trigger.kind !== "window") this.marksOf(task.id).lastDue = due.toISOString();
-    const run: Run = {
-      id: randomUUID(),
-      taskId: task.id,
-      source,
-      due: due?.toISOString() ?? null,
-      startedAt: now.toISOString(),
-      endedAt: null,
-      outcome: "running",
-      reason: "",
-      effort: null,
-      model: null,
-      ms: null,
-      resetKey,
-    };
+    const run = newRun(task, now, due, source, resetKey);
     this.store.data.runs.push(run);
     const abort = new AbortController();
     const entry: Inflight = { abort, cancel: null, done: Promise.resolve() };
@@ -777,18 +797,11 @@ export class Scheduler {
     source: Run["source"],
   ): Run {
     const run: Run = {
-      id: randomUUID(),
-      taskId: task.id,
-      source,
-      due: due?.toISOString() ?? null,
-      startedAt: at.toISOString(),
+      ...newRun(task, at, due, source, resetKey),
       endedAt: at.toISOString(),
       outcome: "failed",
       reason,
-      effort: null,
-      model: null,
       ms: 0,
-      resetKey,
     };
     this.store.data.runs.push(run);
     this.trackSave();
@@ -803,6 +816,7 @@ export class Scheduler {
     }
     this.armedFor = new Map();
     if (!this.started) return;
+    this.recordResets(); // 新建/编辑的窗口任务要赶在下一次额度刷新前记下当前重置点
     const now = this.nowFn();
     let minDelay = Infinity;
     for (const task of this.store.data.tasks) {
@@ -810,16 +824,10 @@ export class Scheduler {
       if (task.trigger.kind === "window") {
         const settled = this.lastSentMs(task) + POST_SEND_SETTLE_MS;
         if (settled > now.getTime()) minDelay = Math.min(minDelay, settled - now.getTime());
-        const info = this.windowInfo(task, now);
-        if (info && !("error" in info) && info.at.getTime() > now.getTime()) {
-          minDelay = Math.min(minDelay, info.at.getTime() - now.getTime());
-        } else if (
-          info &&
-          !("error" in info) &&
-          info.at.getTime() <= now.getTime() &&
-          !this.marksOf(task.id).resetKeys.includes(info.resetKey) &&
-          this.snapshotFresh(now)
-        ) {
+        const due = this.currentWindowDue(task, now);
+        if (due && due.at.getTime() > now.getTime()) {
+          minDelay = Math.min(minDelay, due.at.getTime() - now.getTime());
+        } else if (due && this.windowReady(task, due, now) && this.snapshotFresh(now)) {
           // 空闲窗口、本轮没发过、快照新鲜：立即唤醒去发（每小时最多一次，evaluateWindow 去重）。
           // 快照过期时不走这条——先等一轮刷新，拿新数据再决定，免得按旧快照白发
           minDelay = Math.min(minDelay, 0);
@@ -828,11 +836,8 @@ export class Scheduler {
           minDelay = Math.min(minDelay, this.quotaTried ? QUOTA_REFRESH_MS : 0);
         }
       } else {
-        const marks = this.store.data.marks[task.id];
-        const lastMark = marks?.lastDue ? new Date(marks.lastDue) : null;
-        const updated = new Date(task.updatedAt);
         // 已执行点之后、编辑点之后的第一个到期点才有效，否则会围着作废点空转
-        const base = lastMark && lastMark.getTime() > updated.getTime() ? lastMark : updated;
+        const base = new Date(this.fixedConsumedUntil(task));
         let due: Date;
         try {
           due =

@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path, { join, posix, win32 } from "node:path";
-import { magpieDirs, readKeyDirectory, readModelCache } from "../src/magpie-files";
+import { magpieDirs, readKeyDirectory, readModelCache, xdgConfigHome } from "../src/magpie-files";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -94,6 +94,12 @@ describe("magpieDirs", () => {
       posix,
     );
     expect(d).toEqual({ config: "/tmp/ww-cfg/magpie", cache: "/tmp/ww-cache/magpie" });
+  });
+
+  test("xdgConfigHome：插件数据目录与旧包迁移共用，相对路径同样不算数", () => {
+    expect(xdgConfigHome({ XDG_CONFIG_HOME: " /tmp/ww-cfg " }, posix)).toBe("/tmp/ww-cfg");
+    expect(xdgConfigHome({ XDG_CONFIG_HOME: "relative/cfg" }, posix)).toBe(posix.join(homedir(), ".config"));
+    expect(xdgConfigHome({}, posix)).toBe(posix.join(homedir(), ".config"));
   });
 
   test("XDG 变量是相对路径时不算数（对齐 magpie 的 rooted）", () => {
