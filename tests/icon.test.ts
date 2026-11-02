@@ -15,6 +15,13 @@ test("magpie.icon：data:image URI，且不超过 magpie ownIcon 的 1.5MB 上�
   expect(icon.length).toBeLessThanOrEqual(3 << 19);
 });
 
+test("magpie.icon 与 page/icon.svg 是同一张图：插件页卡片与侧边栏图标不能只改一份", async () => {
+  const icon = pkg.magpie?.icon ?? "";
+  const b64 = icon.slice(icon.indexOf(",") + 1);
+  const svg = await Bun.file(new URL("../page/icon.svg", import.meta.url)).text();
+  expect(Buffer.from(b64, "base64").toString("utf8")).toBe(svg);
+});
+
 test("magpie.page.icon：文件存在，且在页面文件（page/）所在目录内", async () => {
   const pageIcon = pkg.magpie?.page?.icon ?? "";
   const pageFile = pkg.magpie?.page?.file ?? "";
