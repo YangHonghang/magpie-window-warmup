@@ -19,6 +19,12 @@ bun test tests/scheduler.test.ts -t "关键字"   # 按用例名过滤
 - `tests/server.test.ts` 的 `beforeAll` 会调用 `buildAll()` 重建 `dist/`。
 - `tests/fake-gateway.ts` 是假的 magpie 网关，网关 / 调度相关测试都靠它，不打真实网关。
 
+## 发布
+
+- **推送 `main` 即发包**（`.github/workflows/publish.yml`）：先跑 typecheck、测试，并校验 `dist/` 与源码一致（不一致直接失败）；`package.json` 的版本 npm 上还没有才 `npm publish`，没改版本只校验不发。要发新版就把版本号加一并随改动一起推送。
+- 凭据走 npm **Trusted Publishing**（GitHub OIDC），仓库不存 npm token。npmjs.com 上 `magpie-window-warmup` 的 Trusted Publisher 绑定的是本仓库的 `publish.yml`：**改工作流文件名或仓库名会让发布 403**，需在 npm 上同步改。npm 账号 2FA 只有通行密钥，本地手动发布要在交互终端里走浏览器认证。
+- **官方插件市场**：已登记在 [magpie-community/plugins](https://github.com/magpie-community/plugins) 的 `registry.json`（`kind: "page"`，只记包名），magpie 自己从 npm 取最新版，**发版无需同步社区仓库**。只有名称、图标、中英文简介变化时，才去该仓库改 `registry.json` 并提 PR（fork：`YangHonghang/plugins`）。
+
 ## 架构
 
 两层入口 + 一个带路页：
