@@ -1,5 +1,7 @@
 # 窗口预热（Window Warmup）
 
+> **已迁入 magpie 社区仓库**：安装名改为 `@magpie-community/page-window-warmup`，源码与后续开发在 [magpie-community/plugins 的 packages/window-warmup](https://github.com/magpie-community/plugins/tree/main/packages/window-warmup)。本仓库已归档，只保留历史。
+
 Window Warmup is a page plugin for [magpie](https://usemagpie.ai) that sends a short keep-alive message to a provider, account and model of your choice — right after a quota window resets, at a fixed time of day, or every few hours — so the next subscription usage window opens early. It runs inside the Magpie host process; a local page manages tasks and shows run history.
 
 在 magpie 窗口里按计划给指定供应商、账号和模型发一条短消息，用来提前开启下一轮额度（订阅）窗口。消息内容固定为 `hi`、`max_tokens: 16`，只当探活用，不可自定义；**每条消息都会真实发给所选模型并计费**。
